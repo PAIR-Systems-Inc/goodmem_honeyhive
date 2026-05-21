@@ -1,0 +1,45 @@
+[project]
+name = "honeyhive-goodmem"
+description = "GoodMem integration for HoneyHive."
+authors = [{ name = "GoodMem", email = "support@goodmem.ai" }]
+readme = "README.md"
+requires-python = ">=3.11"
+version = "0.1.0"
+license-files = ["LICENSE"]
+urls.homepage = "https://github.com/PAIR-Systems-Inc/goodmem_honeyhive"
+urls.source = "https://github.com/PAIR-Systems-Inc/goodmem_honeyhive"
+urls.issues = "https://github.com/PAIR-Systems-Inc/goodmem_honeyhive/issues"
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+    "honeyhive>=1.0.0rc21",
+    "httpx>=0.24.0,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-timeout",
+    "build",
+    "twine",
+]
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+addopts = "-ra -q -r fEX"
+timeout = 120
+markers = [
+    "integration: marks tests as integration tests that require external services",
+]
+
+[build-system]
+requires = ["flit-core >= 3.11,<4.0"]
+build-backend = "flit_core.buildapi"
