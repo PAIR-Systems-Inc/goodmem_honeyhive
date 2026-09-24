@@ -4,7 +4,7 @@ description = "GoodMem integration for HoneyHive."
 authors = [{ name = "GoodMem", email = "support@goodmem.ai" }]
 readme = "README.md"
 requires-python = ">=3.11"
-version = "0.1.0"
+version = "0.2.0"
 license-files = ["LICENSE"]
 urls.homepage = "https://github.com/PAIR-Systems-Inc/goodmem_honeyhive"
 urls.source = "https://github.com/PAIR-Systems-Inc/goodmem_honeyhive"
@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "honeyhive>=1.0.0rc21",
-    "httpx>=0.24.0,<1",
+    "goodmem>=0.1.35",
 ]
 
 [project.optional-dependencies]
@@ -43,3 +43,14 @@ markers = [
 [build-system]
 requires = ["flit-core >= 3.11,<4.0"]
 build-backend = "flit_core.buildapi"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["I", "B", "C4", "RUF", "E"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

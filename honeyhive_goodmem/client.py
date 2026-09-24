@@ -1,171 +1,330 @@
 """GoodMem client exposed as HoneyHive-traced operations.
 
-Each public method on :class:`GoodMemClient` is decorated with HoneyHive's
-``@trace`` so calls show up as spans in the active HoneyHive session. The
-operations and their option shapes mirror the reference GoodMem integration
-verbatim — only the surface (Python methods returning dicts vs. agent tools
-returning JSON) is adapted to match honeyhive conventions.
+Every operation is decorated with HoneyHive's ``@trace`` so calls show up as
+spans in the active session. That is the point of this package, and it is why
+0.1.0's dropped retrieval statuses mattered more here than anywhere else: a
+degraded retrieval was recorded as a *successful* span, so the observability
+tool reported success for a search that had failed.
 
-Usage::
+Retrieval now carries ``partial`` and ``statuses`` in the traced payload, so
+a span shows what the server actually reported.
+
+Example::
 
     from honeyhive import HoneyHiveTracer
-
-    from goodmem.client import GoodMemClient
-    from goodmem.types import GoodMemConfig
+    from honeyhive_goodmem import GoodMemClient, GoodMemConfig
 
     HoneyHiveTracer.init(api_key="...", project="...")
-
     client = GoodMemClient(GoodMemConfig(base_url="...", api_key="..."))
-    spaces = client.list_spaces()
 """
 
 from __future__ import annotations
 
 import base64
-import json
-import time
+import logging
+import os
 from typing import Any, Optional, Union
 
 from honeyhive import trace
 
-from ._http import _GoodMemTransport
-from .types import GoodMemConfig, GoodMemError, get_mime_type
+from ._filters import from_mapping
+from ._results import (
+    RetrievalOutcome,
+    log_if_degraded,
+    outcome_from_events,
+)
+from .types import MIME_TYPES, GoodMemConfig, GoodMemError
 
-# Defaults match the reference integration so behaviour is identical.
-_DEFAULT_CHUNK_SIZE = 256
-_DEFAULT_CHUNK_OVERLAP = 25
-_DEFAULT_KEEP_STRATEGY = "KEEP_END"
-_DEFAULT_LENGTH_MEASUREMENT = "CHARACTER_COUNT"
-_DEFAULT_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
-_DEFAULT_MAX_RESULTS = 5
-_RETRIEVE_MAX_WAIT_SECONDS = 10.0
-_RETRIEVE_POLL_INTERVAL_SECONDS = 2.0
+logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_LIST_ITEMS = 200
 
 
-def _error_result(operation: str, error: BaseException) -> dict[str, Any]:
-    """Build a uniform failure result for any GoodMem operation."""
-    if isinstance(error, GoodMemError):
-        message = str(error) or f"Failed to {operation}"
-        return {
-            "success": False,
-            "error": message,
-            "details": error.response_body,
-        }
-    return {
-        "success": False,
-        "error": str(error) or f"Failed to {operation}",
-        "details": None,
+def _wrap(exc: Exception, what: str) -> GoodMemError:
+    """Convert an SDK error into a GoodMemError, keeping the server's body."""
+    status = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None)
+    detail = str(exc)
+    if body and body not in detail:
+        detail = f"{detail} -- {body}"
+    error = GoodMemError(f"{what} failed: {detail}")
+    error.status_code = status  # type: ignore[attr-defined]
+    error.body = body  # type: ignore[attr-defined]
+    return error
+
+
+def _space_embedder_ids(space: Any) -> list[str]:
+    """Return the embedder ids a space is actually indexed by."""
+    out: list[str] = []
+    for config in getattr(space, "space_embedders", None) or []:
+        value = getattr(config, "embedder_id", None)
+        if value is None and isinstance(config, dict):
+            value = config.get("embedderId") or config.get("embedder_id")
+        if value:
+            out.append(str(value))
+    return out
+
+
+def _decode_content(raw: bytes, content_type: str) -> tuple[Any, str]:
+    """Decode memory content by its content type: text as text, else base64."""
+    primary = (content_type or "").split(";")[0].strip().lower()
+    charset = "utf-8"
+    for part in (content_type or "").split(";")[1:]:
+        if "charset=" in part:
+            charset = part.split("charset=", 1)[1].strip() or "utf-8"
+    textual = primary.startswith("text/") or primary in {
+        "application/json",
+        "application/xml",
+        "application/javascript",
     }
+    if textual:
+        try:
+            return raw.decode(charset), "text"
+        except (UnicodeDecodeError, LookupError):
+            return base64.b64encode(raw).decode("ascii"), "base64"
+    return base64.b64encode(raw).decode("ascii"), "base64"
 
 
 class GoodMemClient:
-    """Public client for the GoodMem memory-layer API.
-
-    Every method is traced through HoneyHive when a tracer has been
-    initialised via :func:`HoneyHiveTracer.init`. When no tracer is active
-    the methods still execute normally — the ``@trace`` decorator degrades
-    gracefully.
+    """A HoneyHive-traced client for GoodMem.
 
     Args:
-        config: GoodMem connection configuration.
+        config: Connection settings. ``base_url`` and ``api_key`` fall back
+            to ``GOODMEM_BASE_URL`` and ``GOODMEM_API_KEY``.
+        client: An already-configured ``goodmem.Goodmem`` client. When given,
+            its server, credentials and TLS settings are used as-is and it is
+            never closed here.
+        max_list_items: Upper bound on items returned by a listing.
     """
 
-    def __init__(self, config: GoodMemConfig) -> None:
-        self._config = config
-        self._transport = _GoodMemTransport(config)
-
-    # ------------------------------------------------------------------ #
-    # Create Space
-    # ------------------------------------------------------------------ #
-    @trace(event_type="tool", event_name="goodmem.create_space")
-    def create_space(
+    def __init__(
         self,
-        name: str,
-        embedder_id: str,
-        chunk_size: int = _DEFAULT_CHUNK_SIZE,
-        chunk_overlap: int = _DEFAULT_CHUNK_OVERLAP,
-        keep_strategy: str = _DEFAULT_KEEP_STRATEGY,
-        length_measurement: str = _DEFAULT_LENGTH_MEASUREMENT,
-    ) -> dict[str, Any]:
-        """Create a new space, or reuse one with the same name.
+        config: Optional[GoodMemConfig] = None,
+        *,
+        client: Any = None,
+        max_list_items: int = DEFAULT_MAX_LIST_ITEMS,
+    ) -> None:
+        from goodmem import Goodmem
+
+        config = config or GoodMemConfig(
+            base_url=os.environ.get("GOODMEM_BASE_URL", ""),
+            api_key=os.environ.get("GOODMEM_API_KEY", ""),
+        )
+        self.base_url = (config.base_url or "").rstrip("/")
+        # Held privately: never an attribute a repr or a traced payload picks up.
+        self.__api_key = config.api_key
+        self.verify_ssl = config.verify_ssl
+        self.max_list_items = max_list_items
+
+        if client is not None:
+            self._client = client
+            self._owns_client = False
+        else:
+            missing = [
+                name
+                for name, value in (
+                    ("GOODMEM_API_KEY", config.api_key),
+                    ("GOODMEM_BASE_URL", self.base_url),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    f"Missing GoodMem credentials: {', '.join(missing)}. Set "
+                    "them in the environment or pass a GoodMemConfig, or pass "
+                    "an already-configured client=Goodmem(...)."
+                )
+            self._client = Goodmem(
+                base_url=self.base_url,
+                api_key=config.api_key,
+                timeout=config.timeout,
+                verify=config.verify_ssl,
+            )
+            self._owns_client = True
+
+    def __repr__(self) -> str:
+        """A representation that never carries the API key."""
+        return f"{type(self).__name__}(base_url={self.base_url!r})"
+
+    def close(self) -> None:
+        """Close the HTTP client, if this object created it."""
+        if self._owns_client:
+            close = getattr(self._client, "close", None)
+            if callable(close):
+                close()
+
+    def __enter__(self) -> GoodMemClient:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # spaces
+    # ------------------------------------------------------------------
+
+    @trace(event_type="tool", event_name="goodmem.create_space")
+    def create_space(self, name: str, embedder_id: str) -> dict[str, Any]:
+        """Create a space, or reuse one whose embedder already matches.
+
+        A space cannot change embedder after creation, so reusing by name
+        alone silently writes vectors from a different model than the caller
+        asked for -- and 0.1.0 reported the embedder you *asked* for while
+        the space ran another.
 
         Args:
-            name: Unique name for the space. If a space with this name
-                already exists, its ID is returned instead of creating a
-                duplicate.
-            embedder_id: Embedder model ID. Use :meth:`list_embedders` to
-                discover available embedders.
-            chunk_size: Characters per chunk when splitting documents.
-            chunk_overlap: Overlapping characters between consecutive chunks.
-            keep_strategy: Where to attach the separator when splitting.
-                One of ``"KEEP_END"``, ``"KEEP_START"``, ``"DISCARD"``.
-            length_measurement: How chunk size is measured. One of
-                ``"CHARACTER_COUNT"`` or ``"TOKEN_COUNT"``.
+            name: The space name.
+            embedder_id: The embedder the space must use.
 
         Returns:
-            ``{success, space_id, name, embedder_id, message, reused, ...}``.
-            On failure ``{success: False, error, details}``.
+            ``success``, ``space_id``, ``name``, ``embedder_id``, ``reused``.
+
+        Raises:
+            GoodMemError: If a space of that name exists with a different
+                embedder, or if several spaces share the name.
         """
-        # Reuse the existing space when the name already exists.
-        try:
-            existing_body = self._transport.request_json("GET", "/v1/spaces")
-            spaces = (
-                existing_body
-                if isinstance(existing_body, list)
-                else (existing_body or {}).get("spaces") or []
+        existing = [
+            s for s in self._list_spaces_raw() if str(getattr(s, "name", "")) == name
+        ]
+        if len(existing) > 1:
+            raise GoodMemError(
+                f"{len(existing)} spaces are named {name!r}; refusing to guess "
+                "which one was meant. Pass a space id instead."
             )
-            for space in spaces:
-                if space.get("name") == name:
-                    return {
-                        "success": True,
-                        "space_id": space.get("spaceId") or space.get("id"),
-                        "name": space.get("name"),
-                        "embedder_id": embedder_id,
-                        "message": "Space already exists, reusing existing space",
-                        "reused": True,
-                    }
-        except GoodMemError:
-            # Fall through and try to create — the create call will surface
-            # any persistent transport errors with a clean message.
-            pass
-
-        request_body: dict[str, Any] = {
-            "name": name,
-            "spaceEmbedders": [
-                {"embedderId": embedder_id, "defaultRetrievalWeight": 1.0}
-            ],
-            "defaultChunkingConfig": {
-                "recursive": {
-                    "chunkSize": chunk_size,
-                    "chunkOverlap": chunk_overlap,
-                    "separators": list(_DEFAULT_SEPARATORS),
-                    "keepStrategy": keep_strategy,
-                    "separatorIsRegex": False,
-                    "lengthMeasurement": length_measurement,
-                }
-            },
-        }
-
+        if existing:
+            space = existing[0]
+            actual = _space_embedder_ids(space)
+            if embedder_id not in actual:
+                raise GoodMemError(
+                    f"Space {name!r} already exists and is indexed by embedder(s) "
+                    f"{actual}, not {embedder_id!r}. An embedder cannot be changed "
+                    "after creation."
+                )
+            return {
+                "success": True,
+                "space_id": str(getattr(space, "space_id", "")),
+                "name": name,
+                "embedder_id": embedder_id,
+                "reused": True,
+            }
         try:
-            response = self._transport.request_json(
-                "POST", "/v1/spaces", request_body
+            space = self._client.spaces.create(
+                name=name,
+                space_embedders=[
+                    {"embedderId": embedder_id, "defaultRetrievalWeight": 1.0}
+                ],
             )
-        except GoodMemError as exc:
-            return _error_result("create space", exc)
-
+        except Exception as exc:
+            raise _wrap(exc, f"Creating space {name!r}") from exc
         return {
             "success": True,
-            "space_id": response.get("spaceId"),
-            "name": response.get("name"),
+            "space_id": str(getattr(space, "space_id", "")),
+            "name": str(getattr(space, "name", "") or name),
             "embedder_id": embedder_id,
-            "chunking_config": request_body["defaultChunkingConfig"],
-            "message": "Space created successfully",
             "reused": False,
         }
 
-    # ------------------------------------------------------------------ #
-    # Create Memory
-    # ------------------------------------------------------------------ #
+    def _list_spaces_raw(self) -> list[Any]:
+        try:
+            return list(self._client.spaces.list(max_items=self.max_list_items))
+        except Exception as exc:
+            raise _wrap(exc, "Listing spaces") from exc
+
+    @trace(event_type="tool", event_name="goodmem.list_spaces")
+    def list_spaces(self) -> dict[str, Any]:
+        """List spaces, following pagination up to ``max_list_items``."""
+        spaces = self._list_spaces_raw()
+        return {
+            "success": True,
+            "spaces": [
+                {
+                    "space_id": str(getattr(s, "space_id", "")),
+                    "name": str(getattr(s, "name", "")),
+                    "embedder_ids": _space_embedder_ids(s),
+                }
+                for s in spaces
+            ],
+            "total_results": len(spaces),
+        }
+
+    @trace(event_type="tool", event_name="goodmem.get_space")
+    def get_space(self, space_id: str) -> dict[str, Any]:
+        """Fetch one space by id."""
+        try:
+            space = self._client.spaces.get(id=space_id)
+        except Exception as exc:
+            raise _wrap(exc, f"Fetching space {space_id}") from exc
+        return {
+            "success": True,
+            "space_id": str(getattr(space, "space_id", "")),
+            "name": str(getattr(space, "name", "")),
+            "embedder_ids": _space_embedder_ids(space),
+            "labels": dict(getattr(space, "labels", None) or {}),
+        }
+
+    @trace(event_type="tool", event_name="goodmem.update_space")
+    def update_space(
+        self,
+        space_id: str,
+        name: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        replace_labels: bool = False,
+    ) -> dict[str, Any]:
+        """Rename a space or edit its labels.
+
+        ``public_read`` is deliberately gone: the server removed the field
+        and answers ``400 Unrecognized field "publicRead"``.
+        """
+        request: dict[str, Any] = {}
+        if name is not None:
+            request["name"] = name
+        if labels is not None:
+            request["replaceLabels" if replace_labels else "mergeLabels"] = dict(labels)
+        if not request:
+            raise GoodMemError("update_space() needs a name or labels to change.")
+        try:
+            space = self._client.spaces.update(id=space_id, request=request)
+        except Exception as exc:
+            raise _wrap(exc, f"Updating space {space_id}") from exc
+        return {
+            "success": True,
+            "space_id": str(getattr(space, "space_id", "") or space_id),
+            "name": str(getattr(space, "name", "")),
+        }
+
+    @trace(event_type="tool", event_name="goodmem.delete_space")
+    def delete_space(self, space_id: str) -> dict[str, Any]:
+        """Permanently delete a space and every memory in it."""
+        try:
+            self._client.spaces.delete(id=space_id)
+        except Exception as exc:
+            raise _wrap(exc, f"Deleting space {space_id}") from exc
+        return {"success": True, "space_id": space_id}
+
+    @trace(event_type="tool", event_name="goodmem.list_embedders")
+    def list_embedders(self) -> dict[str, Any]:
+        """List the embedder models available on the server."""
+        try:
+            embedders = list(self._client.embedders.list())
+        except Exception as exc:
+            raise _wrap(exc, "Listing embedders") from exc
+        return {
+            "success": True,
+            "embedders": [
+                {
+                    "embedder_id": str(getattr(e, "embedder_id", "")),
+                    "display_name": str(getattr(e, "display_name", "")),
+                    "model_identifier": str(getattr(e, "model_identifier", "")),
+                }
+                for e in embedders
+            ],
+            "total_results": len(embedders),
+        }
+
+    # ------------------------------------------------------------------
+    # memories
+    # ------------------------------------------------------------------
+
     @trace(event_type="tool", event_name="goodmem.create_memory")
     def create_memory(
         self,
@@ -178,497 +337,224 @@ class GoodMemClient:
         tags: Optional[Union[str, list[str]]] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Store a document or text snippet as a memory inside a space.
+        """Store a document or text snippet as a memory.
 
         Args:
-            space_id: Target space ID.
-            file_base64: Base64-encoded file content (PDF, DOCX, image,
-                etc.). The MIME type is auto-detected from
-                ``file_extension``.
-            file_extension: File extension used to infer the MIME type
-                (e.g. ``"pdf"``, ``"png"``, ``"txt"``).
-            text_content: Plain-text body. Ignored when ``file_base64``
-                is also supplied.
-            source: Where the memory came from — stored as
-                ``metadata.source``.
-            author: Author or creator of the content — stored as
-                ``metadata.author``.
-            tags: Comma-separated string or list of tag strings — stored
-                as ``metadata.tags`` (an array on the server).
-            metadata: Extra key-value metadata merged with the fields above.
+            space_id: Target space.
+            file_base64: Base64-encoded file content. The MIME type comes
+                from ``file_extension``.
+            file_extension: Extension used to pick the MIME type.
+            text_content: Plain text. Ignored when ``file_base64`` is given.
+            source: Where the memory came from.
+            author: Who wrote it.
+            tags: One tag or several.
+            metadata: Extra key-value labels.
 
         Returns:
-            ``{success, memory_id, space_id, status, content_type, message}``
-            on success, or ``{success: False, error, details}`` on failure.
+            ``success``, ``memory_id``, ``space_id``, ``status``,
+            ``content_type``.
         """
-        if not file_base64 and not text_content:
-            return {
-                "success": False,
-                "error": "No content provided. Please provide file_base64 or text_content.",
-                "details": None,
-            }
-
-        request_body: dict[str, Any] = {"spaceId": space_id}
-
-        if file_base64:
-            detected = get_mime_type(file_extension) if file_extension else None
-            mime_type = detected or "application/octet-stream"
-            if mime_type.startswith("text/"):
-                try:
-                    decoded = base64.b64decode(file_base64).decode("utf-8")
-                except (ValueError, UnicodeDecodeError) as exc:
-                    return {
-                        "success": False,
-                        "error": (
-                            "Failed to decode file_base64 as UTF-8 text "
-                            f"for MIME type {mime_type}: {exc}"
-                        ),
-                        "details": None,
-                    }
-                request_body["contentType"] = mime_type
-                request_body["originalContent"] = decoded
-            else:
-                request_body["contentType"] = mime_type
-                request_body["originalContentB64"] = file_base64
-        else:
-            request_body["contentType"] = "text/plain"
-            request_body["originalContent"] = text_content
-
-        merged_metadata: dict[str, Any] = {}
-        if metadata:
-            merged_metadata.update(metadata)
+        meta: dict[str, Any] = dict(metadata or {})
         if source:
-            merged_metadata["source"] = source
+            meta["source"] = source
         if author:
-            merged_metadata["author"] = author
+            meta["author"] = author
         if tags:
-            if isinstance(tags, str):
-                tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-            else:
-                tag_list = [t for t in tags if t]
-            if tag_list:
-                merged_metadata["tags"] = tag_list
-        if merged_metadata:
-            request_body["metadata"] = merged_metadata
+            meta["tags"] = ",".join(tags) if isinstance(tags, list) else tags
+
+        kwargs: dict[str, Any] = {"space_id": space_id, "metadata": meta or None}
+        if file_base64:
+            ext = (file_extension or "").lower().lstrip(".")
+            content_type = MIME_TYPES.get(ext, "application/octet-stream")
+            kwargs["original_content_b64"] = file_base64
+            kwargs["content_type"] = content_type
+        elif text_content:
+            content_type = "text/plain"
+            kwargs["original_content"] = text_content
+            kwargs["content_type"] = content_type
+        else:
+            raise GoodMemError("Provide file_base64 or text_content.")
 
         try:
-            response = self._transport.request_json(
-                "POST", "/v1/memories", request_body
-            )
-        except GoodMemError as exc:
-            return _error_result("create memory", exc)
-
+            memory = self._client.memories.create(**kwargs)
+        except Exception as exc:
+            raise _wrap(exc, "Creating a memory") from exc
         return {
             "success": True,
-            "memory_id": response.get("memoryId"),
-            "space_id": response.get("spaceId"),
-            "status": response.get("processingStatus", "PENDING"),
-            "content_type": request_body["contentType"],
-            "message": "Memory created successfully",
+            "memory_id": str(getattr(memory, "memory_id", "")),
+            "space_id": str(getattr(memory, "space_id", "") or space_id),
+            "status": str(getattr(memory, "processing_status", "")),
+            "content_type": content_type,
         }
 
-    # ------------------------------------------------------------------ #
-    # Retrieve Memories
-    # ------------------------------------------------------------------ #
-    # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
+    @trace(event_type="tool", event_name="goodmem.get_memory")
+    def get_memory(
+        self, memory_id: str, include_content: bool = False
+    ) -> dict[str, Any]:
+        """Fetch one memory, optionally with its original content.
+
+        Content is decoded by the memory's own content type: text as text,
+        anything else as base64, so the traced payload is always
+        JSON-serialisable. A content fetch that fails is an error, not a
+        successful result with a note in it.
+        """
+        try:
+            memory = self._client.memories.get(id=memory_id)
+        except Exception as exc:
+            raise _wrap(exc, f"Fetching memory {memory_id}") from exc
+        dump = getattr(memory, "model_dump", None)
+        payload = dump(by_alias=True, exclude_none=True) if dump else {}
+        result: dict[str, Any] = {"success": True, "memory": payload}
+        if include_content:
+            try:
+                raw = self._client.memories.content(id=memory_id)
+            except Exception as exc:
+                raise _wrap(exc, f"Fetching content of memory {memory_id}") from exc
+            content_type = str(
+                payload.get("contentType") or payload.get("content_type") or ""
+            )
+            result["content"], result["content_encoding"] = _decode_content(
+                raw, content_type
+            )
+        return result
+
+    @trace(event_type="tool", event_name="goodmem.list_memories")
+    def list_memories(self, space_id: str) -> dict[str, Any]:
+        """List memories in a space, following pagination."""
+        try:
+            memories = list(
+                self._client.memories.list(
+                    space_id=space_id, max_items=self.max_list_items
+                )
+            )
+        except Exception as exc:
+            raise _wrap(exc, "Listing memories") from exc
+        return {
+            "success": True,
+            "memories": [
+                {
+                    "memory_id": str(getattr(m, "memory_id", "")),
+                    "space_id": str(getattr(m, "space_id", "")),
+                    "content_type": str(getattr(m, "content_type", "")),
+                    "processing_status": str(getattr(m, "processing_status", "")),
+                    "metadata": dict(getattr(m, "metadata", None) or {}),
+                }
+                for m in memories
+            ],
+            "total_results": len(memories),
+        }
+
+    @trace(event_type="tool", event_name="goodmem.delete_memory")
+    def delete_memory(self, memory_id: str) -> dict[str, Any]:
+        """Permanently delete a memory and everything derived from it."""
+        try:
+            self._client.memories.delete(id=memory_id)
+        except Exception as exc:
+            raise _wrap(exc, f"Deleting memory {memory_id}") from exc
+        return {"success": True, "memory_id": memory_id}
+
+    # ------------------------------------------------------------------
+    # retrieval
+    # ------------------------------------------------------------------
+
+    def retrieve(
+        self,
+        query: str,
+        space_ids: Union[str, list[str]],
+        *,
+        max_results: int = 5,
+        reranker_id: Optional[str] = None,
+        metadata_filter: Optional[dict[str, Any]] = None,
+    ) -> RetrievalOutcome:
+        """Retrieve chunks relevant to a query, as a structured outcome."""
+        ids = [space_ids] if isinstance(space_ids, str) else list(space_ids)
+        if not ids:
+            raise GoodMemError("At least one space id is required.")
+        expression = from_mapping(metadata_filter or {})
+        keys: list[dict[str, Any]] = []
+        for space_id in ids:
+            key: dict[str, Any] = {"spaceId": space_id}
+            if expression:
+                key["filter"] = expression
+            keys.append(key)
+        kwargs: dict[str, Any] = {
+            "message": query,
+            "space_keys": keys,
+            "requested_size": max_results,
+            "fetch_memory": True,
+        }
+        if reranker_id:
+            kwargs["reranker_id"] = reranker_id
+        try:
+            stream = self._client.memories.retrieve(**kwargs)
+            with stream as events:
+                outcome = outcome_from_events(events, reranked=bool(reranker_id))
+        except GoodMemError:
+            raise
+        except Exception as exc:
+            raise _wrap(exc, "Retrieval") from exc
+        log_if_degraded(outcome, "goodmem.retrieve_memories")
+        return outcome
+
     @trace(event_type="retrieval", event_name="goodmem.retrieve_memories")
     def retrieve_memories(
         self,
         query: str,
-        space_ids: list[str],
-        max_results: int = _DEFAULT_MAX_RESULTS,
-        include_memory_definition: bool = True,
-        wait_for_indexing: bool = True,
+        space_ids: Union[str, list[str]],
+        max_results: int = 5,
         reranker_id: Optional[str] = None,
-        llm_id: Optional[str] = None,
-        relevance_threshold: Optional[float] = None,
-        llm_temperature: Optional[float] = None,
-        chronological_resort: bool = False,
+        metadata_filter: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Run a semantic similarity search across one or more spaces.
+        """Retrieve memories, as a traced payload.
+
+        The returned dictionary is what a HoneyHive span records. It carries
+        ``partial`` and ``statuses``, so a degraded retrieval is visible in
+        the trace instead of being recorded as a clean success.
 
         Args:
-            query: Natural-language query.
-            space_ids: Space IDs to search across (must be non-empty).
-            max_results: Maximum number of results.
-            include_memory_definition: Fetch the source-document metadata
-                alongside each chunk.
-            wait_for_indexing: Retry for up to 10 seconds when no results
-                are returned. Use this immediately after creating new
-                memories.
-            reranker_id: Optional reranker model ID for result ordering.
-            llm_id: Optional LLM ID to generate a contextual response.
-            relevance_threshold: Minimum score (0–1) for inclusion. Only
-                applies when ``reranker_id`` or ``llm_id`` is set.
-            llm_temperature: Creativity setting (0–2) for ``llm_id``.
-            chronological_resort: Reorder results by creation time.
+            query: The natural-language query.
+            space_ids: One space id or several.
+            max_results: How many chunks to ask the server for.
+            reranker_id: A reranker to apply, if any.
+            metadata_filter: Metadata every memory must match, applied
+                server-side and escaped by :mod:`honeyhive_goodmem.filters`.
 
         Returns:
-            ``{success, result_set_id, results, memories, total_results,
-            query[, abstract_reply]}``. On failure
-            ``{success: False, error, details}``.
+            ``success``, ``query``, ``results``, ``total_results``,
+            ``partial``, ``statuses``, ``result_set_id`` and, when degraded,
+            ``warning``.
         """
-        space_keys = [
-            {"spaceId": sid.strip()}
-            for sid in space_ids
-            if sid and sid.strip()
-        ]
-        if not space_keys:
-            return {
-                "success": False,
-                "error": "At least one space must be selected.",
-                "details": None,
-            }
-
-        request_body: dict[str, Any] = {
-            "message": query,
-            "spaceKeys": space_keys,
-            "requestedSize": max_results or _DEFAULT_MAX_RESULTS,
-            "fetchMemory": bool(include_memory_definition),
-        }
-
-        if reranker_id or llm_id:
-            config: dict[str, Any] = {}
-            if reranker_id:
-                config["reranker_id"] = reranker_id
-            if llm_id:
-                config["llm_id"] = llm_id
-            if relevance_threshold is not None:
-                config["relevance_threshold"] = relevance_threshold
-            if llm_temperature is not None:
-                config["llm_temp"] = llm_temperature
-            if max_results:
-                config["max_results"] = max_results
-            if chronological_resort:
-                config["chronological_resort"] = True
-            request_body["postProcessor"] = {
-                "name": "com.goodmem.retrieval.postprocess.ChatPostProcessorFactory",
-                "config": config,
-            }
-
-        start = time.monotonic()
-        last_result: dict[str, Any] = {}
-
-        try:
-            while True:
-                response_text = self._transport.request_text(
-                    "POST", "/v1/memories:retrieve", request_body
-                )
-                last_result = _parse_retrieve_response(response_text, query)
-
-                if last_result["results"] or not wait_for_indexing:
-                    return last_result
-
-                if time.monotonic() - start >= _RETRIEVE_MAX_WAIT_SECONDS:
-                    last_result["message"] = (
-                        "No results found after waiting for indexing. "
-                        "Memories may still be processing."
-                    )
-                    return last_result
-
-                time.sleep(_RETRIEVE_POLL_INTERVAL_SECONDS)
-        except GoodMemError as exc:
-            return _error_result("retrieve memories", exc)
-
-    # ------------------------------------------------------------------ #
-    # Get Memory
-    # ------------------------------------------------------------------ #
-    @trace(event_type="tool", event_name="goodmem.get_memory")
-    def get_memory(
-        self,
-        memory_id: str,
-        include_content: bool = True,
-    ) -> dict[str, Any]:
-        """Fetch a memory record by ID.
-
-        Args:
-            memory_id: UUID returned from :meth:`create_memory`.
-            include_content: When ``True``, also fetch the original document
-                content from ``/v1/memories/{id}/content``.
-
-        Returns:
-            ``{success, memory[, content][, content_error]}`` on success,
-            or ``{success: False, error, details}`` on failure.
-        """
-        try:
-            memory = self._transport.request_json(
-                "GET", f"/v1/memories/{memory_id}"
-            )
-        except GoodMemError as exc:
-            return _error_result("get memory", exc)
-
-        result: dict[str, Any] = {"success": True, "memory": memory}
-        if include_content:
-            try:
-                result["content"] = self._transport.request_json(
-                    "GET", f"/v1/memories/{memory_id}/content"
-                )
-            except GoodMemError as exc:
-                result["content_error"] = (
-                    f"Failed to fetch content: {exc}"
-                )
-        return result
-
-    # ------------------------------------------------------------------ #
-    # Delete Memory
-    # ------------------------------------------------------------------ #
-    @trace(event_type="tool", event_name="goodmem.delete_memory")
-    def delete_memory(self, memory_id: str) -> dict[str, Any]:
-        """Permanently delete a memory and its embeddings.
-
-        Args:
-            memory_id: UUID of the memory to delete.
-        """
-        try:
-            self._transport.request_json(
-                "DELETE", f"/v1/memories/{memory_id}"
-            )
-        except GoodMemError as exc:
-            return _error_result("delete memory", exc)
-        return {
-            "success": True,
-            "memory_id": memory_id,
-            "message": "Memory deleted successfully",
-        }
-
-    # ------------------------------------------------------------------ #
-    # Get Space
-    # ------------------------------------------------------------------ #
-    @trace(event_type="tool", event_name="goodmem.get_space")
-    def get_space(self, space_id: str) -> dict[str, Any]:
-        """Fetch a single space by ID.
-
-        Args:
-            space_id: UUID of the space to fetch.
-        """
-        try:
-            space = self._transport.request_json(
-                "GET", f"/v1/spaces/{space_id}"
-            )
-        except GoodMemError as exc:
-            return _error_result("get space", exc)
-        return {"success": True, "space": space}
-
-    # ------------------------------------------------------------------ #
-    # Update Space
-    # ------------------------------------------------------------------ #
-    @trace(event_type="tool", event_name="goodmem.update_space")
-    def update_space(
-        self,
-        space_id: str,
-        name: Optional[str] = None,
-        public_read: Optional[bool] = None,
-        replace_labels: Optional[dict[str, str]] = None,
-        merge_labels: Optional[dict[str, str]] = None,
-        default_chunking_config: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Update mutable fields on a space.
-
-        Only the fields you pass are sent — everything else is left
-        untouched. The GoodMem server accepts these fields:
-        ``name``, ``publicRead``, ``replaceLabels``, ``mergeLabels``,
-        ``defaultChunkingConfig``.
-
-        Args:
-            space_id: UUID of the space to update.
-            name: New space name.
-            public_read: Whether the space is readable by all callers.
-            replace_labels: Replaces the existing labels map entirely.
-            merge_labels: Merges the supplied labels into the existing map.
-            default_chunking_config: Replacement chunking configuration.
-        """
-        body: dict[str, Any] = {}
-        if name is not None:
-            body["name"] = name
-        if public_read is not None:
-            body["publicRead"] = public_read
-        if replace_labels is not None:
-            body["replaceLabels"] = replace_labels
-        if merge_labels is not None:
-            body["mergeLabels"] = merge_labels
-        if default_chunking_config is not None:
-            body["defaultChunkingConfig"] = default_chunking_config
-        if not body:
-            return {
-                "success": False,
-                "error": (
-                    "update_space requires at least one field to update "
-                    "(name, public_read, replace_labels, merge_labels, "
-                    "default_chunking_config)."
-                ),
-                "details": None,
-            }
-        try:
-            updated = self._transport.request_json(
-                "PUT", f"/v1/spaces/{space_id}", body
-            )
-        except GoodMemError as exc:
-            return _error_result("update space", exc)
-        return {
-            "success": True,
-            "space": updated,
-            "space_id": updated.get("spaceId") or space_id,
-            "message": "Space updated successfully",
-        }
-
-    # ------------------------------------------------------------------ #
-    # Delete Space
-    # ------------------------------------------------------------------ #
-    @trace(event_type="tool", event_name="goodmem.delete_space")
-    def delete_space(self, space_id: str) -> dict[str, Any]:
-        """Permanently delete a space and all of its memories.
-
-        Args:
-            space_id: UUID of the space to delete.
-        """
-        try:
-            self._transport.request_json(
-                "DELETE", f"/v1/spaces/{space_id}"
-            )
-        except GoodMemError as exc:
-            return _error_result("delete space", exc)
-        return {
-            "success": True,
-            "space_id": space_id,
-            "message": "Space deleted successfully",
-        }
-
-    # ------------------------------------------------------------------ #
-    # List Memories
-    # ------------------------------------------------------------------ #
-    @trace(event_type="tool", event_name="goodmem.list_memories")
-    def list_memories(self, space_id: str) -> dict[str, Any]:
-        """List the memories stored in a single space.
-
-        Args:
-            space_id: UUID of the space to list memories from.
-        """
-        try:
-            body = self._transport.request_json(
-                "GET", f"/v1/spaces/{space_id}/memories"
-            )
-        except GoodMemError as exc:
-            return _error_result("list memories", exc)
-        memories = (
-            body
-            if isinstance(body, list)
-            else (body or {}).get("memories") or []
+        outcome = self.retrieve(
+            query,
+            space_ids,
+            max_results=max_results,
+            reranker_id=reranker_id,
+            metadata_filter=metadata_filter,
         )
-        return {
+        payload: dict[str, Any] = {
             "success": True,
-            "memories": memories,
-            "total_memories": len(memories),
-            "space_id": space_id,
-        }
-
-    # ------------------------------------------------------------------ #
-    # List Spaces
-    # ------------------------------------------------------------------ #
-    @trace(event_type="tool", event_name="goodmem.list_spaces")
-    def list_spaces(self) -> dict[str, Any]:
-        """List all spaces visible to the current API key."""
-        try:
-            body = self._transport.request_json("GET", "/v1/spaces")
-        except GoodMemError as exc:
-            return _error_result("list spaces", exc)
-        spaces = body if isinstance(body, list) else (body or {}).get("spaces") or []
-        return {
-            "success": True,
-            "spaces": [
+            "query": query,
+            "results": [
                 {
-                    "space_id": s.get("spaceId") or s.get("id"),
-                    "name": s.get("name") or "Unnamed",
+                    "chunk_id": h.chunk_id,
+                    "chunk_text": h.text,
+                    "memory_id": h.memory_id,
+                    "space_id": h.space_id,
+                    "score": h.score,
+                    "raw_score": h.raw_score,
+                    "score_kind": h.score_kind,
+                    "content_type": h.content_type,
+                    "metadata": h.metadata,
                 }
-                for s in spaces
+                for h in outcome.hits
             ],
-            "total_spaces": len(spaces),
+            "total_results": len(outcome.hits),
+            "partial": outcome.partial,
+            "statuses": outcome.status_dicts,
+            "result_set_id": outcome.result_set_id,
         }
-
-    # ------------------------------------------------------------------ #
-    # List Embedders
-    # ------------------------------------------------------------------ #
-    @trace(event_type="tool", event_name="goodmem.list_embedders")
-    def list_embedders(self) -> dict[str, Any]:
-        """List all embedders that can be used when creating a space."""
-        try:
-            body = self._transport.request_json("GET", "/v1/embedders")
-        except GoodMemError as exc:
-            return _error_result("list embedders", exc)
-        embedders = (
-            body if isinstance(body, list) else (body or {}).get("embedders") or []
-        )
-        return {
-            "success": True,
-            "embedders": [
-                {
-                    "embedder_id": e.get("embedderId") or e.get("id"),
-                    "display_name": e.get("displayName")
-                    or e.get("name")
-                    or "Unnamed",
-                    "model_identifier": e.get("modelIdentifier")
-                    or e.get("model")
-                    or "unknown",
-                }
-                for e in embedders
-            ],
-            "total_embedders": len(embedders),
-        }
-
-
-def _parse_retrieve_response(text: str, query: str) -> dict[str, Any]:
-    """Parse the NDJSON / SSE response body returned by ``/v1/memories:retrieve``.
-
-    The server may stream either NDJSON (one JSON object per line) or
-    text/event-stream (``data: {...}`` lines with optional ``event:`` lines).
-    Both formats are handled here.
-    """
-    results: list[dict[str, Any]] = []
-    memories: list[Any] = []
-    result_set_id = ""
-    abstract_reply: Any = None
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("data:"):
-            line = line[5:].strip()
-        if not line or line.startswith("event:"):
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            # Skip non-JSON lines such as SSE comments or stream terminators.
-            continue
-
-        if "resultSetBoundary" in item:
-            boundary = item["resultSetBoundary"] or {}
-            result_set_id = boundary.get("resultSetId", "")
-        elif "memoryDefinition" in item:
-            memories.append(item["memoryDefinition"])
-        elif "abstractReply" in item:
-            abstract_reply = item["abstractReply"]
-        elif "retrievedItem" in item:
-            chunk_envelope = (item["retrievedItem"] or {}).get("chunk") or {}
-            inner_chunk = chunk_envelope.get("chunk") or {}
-            results.append(
-                {
-                    "chunk_id": inner_chunk.get("chunkId"),
-                    "chunk_text": inner_chunk.get("chunkText"),
-                    "memory_id": inner_chunk.get("memoryId"),
-                    "relevance_score": chunk_envelope.get("relevanceScore"),
-                    "memory_index": chunk_envelope.get("memoryIndex"),
-                }
-            )
-
-    output: dict[str, Any] = {
-        "success": True,
-        "result_set_id": result_set_id,
-        "results": results,
-        "memories": memories,
-        "total_results": len(results),
-        "query": query,
-    }
-    if abstract_reply is not None:
-        output["abstract_reply"] = abstract_reply
-    return output
+        if outcome.partial:
+            payload["warning"] = outcome.warning_text()
+        if outcome.abstract_reply:
+            payload["abstract_reply"] = outcome.abstract_reply
+        return payload
