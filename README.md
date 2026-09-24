@@ -1,93 +1,172 @@
 # honeyhive-goodmem
 
-[GoodMem](https://goodmem.ai) integration for
-[HoneyHive](https://honeyhive.ai).
+[GoodMem](https://docs.goodmem.ai) memory as [HoneyHive](https://honeyhive.ai)-traced
+operations. Every call appears as a span alongside the rest of your agent's
+work, so memory reads and writes are visible in the same trace as the model
+calls they feed.
 
-This package wraps the GoodMem REST API with a Python client whose every
-operation is decorated with HoneyHive's `@trace`, so calls show up as spans in
-the active HoneyHive session. The operation shapes mirror the reference
-GoodMem integration so behavior is identical across frameworks.
+**Version 0.2.0.** Verified against GoodMem server **v1.0.320**.
 
-## Installation
+> **Upgrading from 0.1.0.** This is an observability package, which makes
+> 0.1.0's worst defect specific to it: retrieval statuses were dropped, so a
+> retrieval that **failed** was recorded as a **successful span**. A space
+> whose embedder was unavailable produced `success: true, totalResults: 0` —
+> in HoneyHive that reads as "the index is empty", not "the search broke".
+> See [Changes in 0.2.0](#changes-in-020).
+
+> **Security.** 0.1.0's test file carried a live GoodMem API key as a default
+> value, on the public default branch and in the `v0.1.0` tag. It is removed
+> here and the environment variable is now required with no fallback — but
+> removing it from the tree does not un-leak it. **That key needs rotating.**
+
+## Install
 
 ```bash
 pip install honeyhive-goodmem
 ```
 
-For local development:
-
-```bash
-pip install -e .
-```
-
-## Quickstart
+## Use
 
 ```python
 from honeyhive import HoneyHiveTracer
 from honeyhive_goodmem import GoodMemClient, GoodMemConfig
 
-HoneyHiveTracer.init(api_key="hh_...", project="my-project")
+HoneyHiveTracer.init(api_key="<your-honeyhive-key>", project="my-project")
 
 client = GoodMemClient(
-    GoodMemConfig(
-        base_url="https://localhost:8080",
-        api_key="gm_xxxxxxxxxxxxxxxxxxxxxxxx",
-        verify_ssl=False,  # self-signed local server
-    )
+    GoodMemConfig(base_url="https://your-goodmem-server", api_key="<your-goodmem-key>")
 )
-
-embedders = client.list_embedders()
-embedder_id = embedders["embedders"][0]["embedder_id"]
-
-space = client.create_space(name="quickstart", embedder_id=embedder_id)
-space_id = space["space_id"]
-
-client.create_memory(
-    space_id=space_id,
-    text_content="The capital of France is Paris.",
-)
-
-results = client.retrieve_memories(
-    query="What is the capital of France?",
-    space_ids=[space_id],
-    max_results=3,
-)
-print(results)
 ```
 
-## Available operations
+Both GoodMem settings fall back to `GOODMEM_BASE_URL` and `GOODMEM_API_KEY`.
+Without a tracer the methods still run; HoneyHive logs that no tracer is
+active and no span is emitted.
 
-`GoodMemClient` exposes the following 11 traced methods, matching the
-reference GoodMem integration:
+## What a retrieval span records
 
-| Method | Description |
-|--------|-------------|
-| `list_embedders` | List embedder models available on the server |
-| `list_spaces` | List all spaces accessible to the API key |
-| `get_space` | Fetch a space by ID |
-| `create_space` | Create a space (idempotent by name) |
-| `update_space` | Update a space's name / labels / public-read flag |
-| `delete_space` | Delete a space |
-| `create_memory` | Store text or a file as a memory |
-| `list_memories` | List memories in a space |
-| `retrieve_memories` | Semantic retrieval, with optional reranker / LLM |
-| `get_memory` | Fetch a memory by ID (with original content) |
-| `delete_memory` | Delete a memory |
+```python
+client.retrieve_memories("what did I store?", space_ids=["<space-uuid>"], max_results=5)
+```
 
-### Retrieval options
+```python
+{
+  "success": True,
+  "query": "...",
+  "results": [
+    {
+      "chunk_id": "...", "chunk_text": "...", "memory_id": "...", "space_id": "...",
+      "score": 0.64,          # higher is better
+      "raw_score": -0.64,     # exactly what the server sent
+      "score_kind": "vector", # or "reranker" -- not the same scale
+      "content_type": "text/plain",
+      "metadata": {...},      # the memory's metadata, joined by UUID
+    }
+  ],
+  "total_results": 1,
+  "partial": False,           # True when the server reported a problem
+  "statuses": [],             # what it reported
+  "result_set_id": "...",
+}
+```
 
-`GoodMemClient.retrieve_memories` accepts the GoodMem post-processor
-parameters:
+`partial` means exactly one thing: **the server reported a real problem during
+this retrieval.** It is independent of whether hits came back. A degraded
+search still returns whatever arrived, with `partial` set and a `warning` key;
+when nothing usable arrives the result is empty and still flagged. The span
+therefore shows a failed retrieval as failed.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `reranker_id` | UUID | Reranker model to improve result ordering |
-| `llm_id` | UUID | LLM used to generate a contextual abstract reply |
-| `relevance_threshold` | 0–1 | Minimum score for including a result |
-| `llm_temperature` | 0–2 | Creativity for the LLM post-processor |
-| `max_results` | int | Cap on returned chunks |
-| `chronological_resort` | bool | Reorder results by memory creation time |
+For structured use, `client.retrieve(...)` returns the same data as a
+`RetrievalOutcome` object instead of a traced dictionary.
+
+### Scores
+
+GoodMem produces two kinds of score and they are not comparable. **Vector**
+scores are negative distances, so `score` is the flipped value with
+`raw_score` kept beside it. **Reranker** scores are already higher-is-better,
+on a **provider-dependent** scale — measured live on the same five documents,
+Voyage `rerank-2.5` returned `0.27..0.93` and Jina `jina-reranker-v3` returned
+`-0.14..0.43`. There is therefore no default threshold anywhere in this
+package.
+
+## Metadata filters
+
+Filters are expressions evaluated server-side, not SQL:
+
+```python
+from honeyhive_goodmem import filters
+
+client.retrieve_memories("q", ["<space-uuid>"], metadata_filter={"tenant": "acme"})
+
+expression = filters.all_of(
+    filters.equals("tenant", "acme"),
+    filters.compare("year", ">=", 2026),
+)
+```
+
+The helper applies the escaping the server accepts (`'` → `\'`, `\` → `\\`;
+SQL-style `''` doubling is rejected with HTTP 400), refuses control
+characters, restricts field names, and casts each value to the type GoodMem
+stored — a boolean compared as `TEXT` is accepted with HTTP 200 and matches
+nothing.
+
+## Operations
+
+| Method | Event |
+| --- | --- |
+| `create_space`, `list_spaces`, `get_space`, `update_space`, `delete_space` | `tool` |
+| `list_embedders` | `tool` |
+| `create_memory`, `get_memory`, `list_memories`, `delete_memory` | `tool` |
+| `retrieve_memories` | `retrieval` |
+
+`update_space` takes `name` and `labels`. It no longer offers `public_read`:
+the server removed that field and answers `400 Unrecognized field "publicRead"`.
+
+## Changes in 0.2.0
+
+Reproduced against the published 0.1.0 wheel, live against GoodMem v1.0.320.
+
+| Was | Now |
+| --- | --- |
+| A live GoodMem API key was the default value of `GOODMEM_API_KEY` in the test file, on the public default branch | Removed; the variable is required with no fallback. **The key still needs rotating** |
+| A failing embedder produced `success: true, totalResults: 0` — the server's `EMBEDDER_FAILED` was dropped, so the span said success | `partial` + `statuses` + `warning` in the traced payload |
+| A broken reranker produced `success: true` with three statuses discarded | Same contract; hits are still returned, flagged |
+| Hand-written `httpx` client | Official `goodmem` SDK |
+| `public_read` was a parameter; the server answers HTTP 400 | Gone |
+| Empty search took **11.65 s** — `wait_for_indexing` on by default | **0.31 s**; the read path never polls |
+| Reusing a space name reported the embedder you asked for while the space ran another | Reuse requires a match; a mismatch names both |
+| Chunks and memories were two arrays joined by positional `memory_index` | Joined by UUID, de-duplicated by chunk id |
+| Raw negative scores in the span | `score` / `raw_score` / `score_kind` |
+| `nextToken` appeared nowhere — listings returned one page | Paginated, bounded by `max_list_items` |
+| No metadata filtering | `filters`, escaped and type-correct |
+| The API key was a public attribute | Private; absent from `repr` and from every traced payload |
+| 13 live-only tests that fell back to a committed key; no CI | 33 offline + 16 live; CI on 3.11–3.13 |
+
+Already correct in 0.1.0 and unchanged: request timeouts (30 s by default),
+and the error path — the server's own message reaches the caller.
+
+## Tests
+
+| Suite | Count | Needs |
+| --- | --- | --- |
+| `tests/test_honeyhive_goodmem.py` | 33 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server |
+| `tests/test_honeyhive_goodmem_live.py` | 16 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
+
+```bash
+pip install -e . pytest httpx "ruff==0.7.4" mypy
+
+pytest tests/test_honeyhive_goodmem.py
+
+GOODMEM_API_KEY=... GOODMEM_BASE_URL=... \
+  GOODMEM_TEST_EMBEDDER_ID=... \
+  pytest tests/test_honeyhive_goodmem_live.py
+
+ruff check honeyhive_goodmem tests && mypy honeyhive_goodmem
+```
+
+One offline test scans the tree for a credential-shaped string, so the defect
+that shipped in 0.1.0 cannot come back unnoticed. The live suite creates one
+space per run and asserts, against a fresh listing, that it is gone.
 
 ## License
 
-MIT
+Apache-2.0.

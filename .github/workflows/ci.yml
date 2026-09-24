@@ -1,0 +1,95 @@
+# Tests, lint and the gates. 0.1.0 shipped to PyPI with no CI: its only tests
+# hit a live server and fell back to an API key committed in the file, so they
+# passed on one machine and told nobody anything.
+
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e . pytest httpx "ruff==0.7.4" mypy
+
+      - name: Lint
+        run: |
+          set -euo pipefail
+          ruff check honeyhive_goodmem tests
+          ruff format --check honeyhive_goodmem tests
+
+      - name: Types
+        run: mypy honeyhive_goodmem
+
+      - name: Offline suite
+        run: pytest tests/test_honeyhive_goodmem.py -v
+
+      - name: Live tests must skip without credentials
+        env:
+          GOODMEM_API_KEY: ""
+          GOODMEM_BASE_URL: ""
+        run: |
+          set -euo pipefail
+          pytest tests/test_honeyhive_goodmem_live.py -v > live.log 2>&1
+          grep -q "skipped" live.log
+          if grep -qE "^tests.*(PASSED|FAILED)" live.log; then
+            echo "A live test ran without credentials -- a key may be baked in."
+            exit 1
+          fi
+
+      - name: Package builds and imports in a clean environment
+        run: |
+          set -euo pipefail
+          pip install build
+          python -m build
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install --quiet dist/*.whl
+          /tmp/clean/bin/python -c "import honeyhive_goodmem; print(honeyhive_goodmem.__version__)"
+
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No GoodMem API key in any tracked file
+        run: |
+          set -euo pipefail
+          # 0.1.0 shipped a live key here as a test default, on the default
+          # branch and in the v0.1.0 tag.
+          if git ls-files -z | xargs -0 grep -IEn "gm_[a-z0-9]{20,}" ; then
+            echo "A GoodMem API key is committed to this repository."
+            exit 1
+          fi
+          echo "No credential-shaped string in any tracked file."
+
+      - name: No developer-specific absolute path in the tests
+        run: |
+          set -euo pipefail
+          # 0.1.0's tests defaulted a PDF path into one person's home directory.
+          if git ls-files -z 'tests/*' | xargs -0 grep -IEn "/home/[a-z]+/" ; then
+            echo "A developer-specific absolute path is committed in tests."
+            exit 1
+          fi
+          echo "No developer-specific paths in tests."
