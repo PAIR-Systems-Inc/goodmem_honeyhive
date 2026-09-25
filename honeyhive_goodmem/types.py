@@ -119,7 +119,7 @@ def _as_secret(value: object) -> SecretStr:
     return SecretStr(str.__str__(raw))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class GoodMemConfig:
     """Configuration for connecting to a GoodMem API instance.
 
@@ -138,18 +138,29 @@ class GoodMemConfig:
     """
 
     base_url: str
-    api_key: Union[str, SecretStr]
+    # Typed as what is stored, so ``config.api_key.get_secret_value()``
+    # type-checks; the constructor below still accepts a plain ``str``.
+    api_key: SecretStr
     verify_ssl: bool = True
     timeout: float = 30.0
 
-    def __post_init__(self) -> None:
-        if not self.base_url:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: Union[str, SecretStr],
+        verify_ssl: bool = True,
+        timeout: float = 30.0,
+    ) -> None:
+        if not base_url:
             raise ValueError("GoodMem base_url is required")
-        secret = _as_secret(self.api_key)
+        secret = _as_secret(api_key)
         if not secret.get_secret_value():
             raise ValueError("GoodMem api_key is required")
-        # Frozen: the one place the stored value is replaced by its wrapper.
+        # Frozen dataclass: assign through object.__setattr__.
+        object.__setattr__(self, "base_url", base_url)
         object.__setattr__(self, "api_key", secret)
+        object.__setattr__(self, "verify_ssl", verify_ssl)
+        object.__setattr__(self, "timeout", timeout)
 
     def get_api_key(self) -> str:
         """Return the raw API key, for handing to an HTTP client."""

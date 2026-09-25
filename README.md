@@ -64,6 +64,8 @@ raw = config.get_api_key()     # or config.api_key.get_secret_value()
 
 `config.api_key` is no longer a `str`, so passing it straight to an HTTP
 library raises `TypeError` rather than sending the mask; use `get_api_key()`.
+For the same reason `config.api_key == "<your-goodmem-key>"` is always
+`False`; compare `config.get_api_key()` instead.
 
 Without a tracer the methods still run; HoneyHive logs that no tracer is
 active and no span is emitted. With a tracer, a call that raises
@@ -184,6 +186,9 @@ SDK and `httpx`:
 | `pip install -e .` into a fresh environment could not `import honeyhive_goodmem`: `honeyhive` imports `requests` without declaring it, and `opentelemetry-exporter-otlp-proto-http` 1.45.0 stopped pulling it in | `requests` is declared here |
 | `GoodMemConfig` held `api_key` as a plain `str`, so `repr()`, `str()`, f-strings, `logger.warning("%s", config)` and `dataclasses.asdict()` all printed the key. A `@trace`-decorated function taking the config exported it to HoneyHive as the span attribute `honeyhive_inputs.config`. `GoodMemClient` also kept the raw key in `_GoodMemClient__api_key`, so `json.dumps(vars(client), default=str)` contained it | The key is held in a `SecretStr` that renders as `**********` in every one of those, including the span. The client keeps no copy. The server still receives the real key in `X-API-Key`; read it yourself with `config.get_api_key()` |
 | With a `reranker_id` whose reranker failed, the server's vector fallback hits were labelled `score_kind: "reranker"` and left un-negated, so a `-0.58` distance was reported as `score: -0.58` | `score_kind` comes from the response: after `RERANKING_FAILED` or a reranker `NOT_FOUND` the hits are `"vector"` and scored `0.58`. `partial` and both statuses are unchanged |
+| With a HoneyHive tracer active, a write that failed with a server message containing `Tracer error` was sent twice: honeyhive's `@trace` re-runs the function, untraced, whenever the error text contains that phrase, and the server can echo request content. Measured: `create_memory` and `create_space` sent 2 POSTs, `delete_memory` and `delete_space` 2 DELETEs | Sent once. Every method runs at most once per call; a re-run returns the first result or re-raises the first error. Tracing is unchanged |
+| A `uuid.UUID` whose stored `int` raised from `__index__`, or an iterable of space ids whose `__iter__` raised, escaped as `RuntimeError`/`KeyError` instead of `GoodMemError` (nothing was sent) | `GoodMemError`, before any request |
+| `config.api_key` was typed `str \| SecretStr` although it is always a `SecretStr`, so a typed caller of `config.api_key.get_secret_value()` got a mypy error | Typed `SecretStr`; the constructor still accepts a `str` |
 
 ## Changes in 0.2.0
 

@@ -29,8 +29,6 @@ import logging
 import os
 from typing import Any, Optional, Union
 
-from honeyhive import trace
-
 from ._filters import from_mapping
 from ._ids import require_uuid, require_uuids
 from ._results import (
@@ -38,6 +36,7 @@ from ._results import (
     log_if_degraded,
     outcome_from_events,
 )
+from ._tracing import traced
 from .types import MIME_TYPES, GoodMemConfig, GoodMemError
 
 logger = logging.getLogger(__name__)
@@ -170,7 +169,7 @@ class GoodMemClient:
     # spaces
     # ------------------------------------------------------------------
 
-    @trace(event_type="tool", event_name="goodmem.create_space")
+    @traced(event_type="tool", event_name="goodmem.create_space")
     def create_space(self, name: str, embedder_id: str) -> dict[str, Any]:
         """Create a space, or reuse one whose embedder already matches.
 
@@ -239,7 +238,7 @@ class GoodMemClient:
         except Exception as exc:
             raise _wrap(exc, "Listing spaces") from exc
 
-    @trace(event_type="tool", event_name="goodmem.list_spaces")
+    @traced(event_type="tool", event_name="goodmem.list_spaces")
     def list_spaces(self) -> dict[str, Any]:
         """List spaces, following pagination up to ``max_list_items``."""
         spaces = self._list_spaces_raw()
@@ -256,7 +255,7 @@ class GoodMemClient:
             "total_results": len(spaces),
         }
 
-    @trace(event_type="tool", event_name="goodmem.get_space")
+    @traced(event_type="tool", event_name="goodmem.get_space")
     def get_space(self, space_id: str) -> dict[str, Any]:
         """Fetch one space by id."""
         space_id = require_uuid(space_id, "space_id")
@@ -272,7 +271,7 @@ class GoodMemClient:
             "labels": dict(getattr(space, "labels", None) or {}),
         }
 
-    @trace(event_type="tool", event_name="goodmem.update_space")
+    @traced(event_type="tool", event_name="goodmem.update_space")
     def update_space(
         self,
         space_id: str,
@@ -303,7 +302,7 @@ class GoodMemClient:
             "name": str(getattr(space, "name", "")),
         }
 
-    @trace(event_type="tool", event_name="goodmem.delete_space")
+    @traced(event_type="tool", event_name="goodmem.delete_space")
     def delete_space(self, space_id: str) -> dict[str, Any]:
         """Permanently delete a space and every memory in it."""
         space_id = require_uuid(space_id, "space_id")
@@ -313,7 +312,7 @@ class GoodMemClient:
             raise _wrap(exc, f"Deleting space {space_id}") from exc
         return {"success": True, "space_id": space_id}
 
-    @trace(event_type="tool", event_name="goodmem.list_embedders")
+    @traced(event_type="tool", event_name="goodmem.list_embedders")
     def list_embedders(self) -> dict[str, Any]:
         """List the embedder models available on the server."""
         try:
@@ -337,7 +336,7 @@ class GoodMemClient:
     # memories
     # ------------------------------------------------------------------
 
-    @trace(event_type="tool", event_name="goodmem.create_memory")
+    @traced(event_type="tool", event_name="goodmem.create_memory")
     def create_memory(
         self,
         space_id: str,
@@ -400,7 +399,7 @@ class GoodMemClient:
             "content_type": content_type,
         }
 
-    @trace(event_type="tool", event_name="goodmem.get_memory")
+    @traced(event_type="tool", event_name="goodmem.get_memory")
     def get_memory(
         self, memory_id: str, include_content: bool = False
     ) -> dict[str, Any]:
@@ -432,7 +431,7 @@ class GoodMemClient:
             )
         return result
 
-    @trace(event_type="tool", event_name="goodmem.list_memories")
+    @traced(event_type="tool", event_name="goodmem.list_memories")
     def list_memories(self, space_id: str) -> dict[str, Any]:
         """List memories in a space, following pagination."""
         space_id = require_uuid(space_id, "space_id")
@@ -459,7 +458,7 @@ class GoodMemClient:
             "total_results": len(memories),
         }
 
-    @trace(event_type="tool", event_name="goodmem.delete_memory")
+    @traced(event_type="tool", event_name="goodmem.delete_memory")
     def delete_memory(self, memory_id: str) -> dict[str, Any]:
         """Permanently delete a memory and everything derived from it."""
         memory_id = require_uuid(memory_id, "memory_id")
@@ -514,7 +513,7 @@ class GoodMemClient:
         log_if_degraded(outcome, "goodmem.retrieve_memories")
         return outcome
 
-    @trace(event_type="retrieval", event_name="goodmem.retrieve_memories")
+    @traced(event_type="retrieval", event_name="goodmem.retrieve_memories")
     def retrieve_memories(
         self,
         query: str,

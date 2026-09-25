@@ -493,6 +493,13 @@ class _Recorder(BaseHTTPRequestHandler):
         self.server.requests.append((self.command, self.path, body))  # type: ignore[attr-defined]
         self.server.api_keys.append(self.headers.get("X-API-Key"))  # type: ignore[attr-defined]
         status, content_type, payload = _reply(self.command, urlsplit(self.path).path)
+        fail = getattr(self.server, "fail", None)
+        if (
+            fail
+            and fail[0] == self.command
+            and urlsplit(self.path).path.startswith(fail[1])
+        ):
+            status, content_type, payload = fail[2], "application/json", fail[3]
         self.send_response(status)
         self.send_header("content-type", content_type)
         self.send_header("content-length", str(len(payload)))
@@ -510,6 +517,7 @@ def recording_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Recorder)
     server.requests = []  # type: ignore[attr-defined]
     server.api_keys = []  # type: ignore[attr-defined]
+    server.fail = None  # type: ignore[attr-defined]  # (verb, path prefix, status, body)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield server
@@ -522,6 +530,7 @@ def recorded(recording_server, monkeypatch):
     """A client built the ordinary way, pointed at the recording server."""
     recording_server.requests.clear()
     recording_server.api_keys.clear()
+    recording_server.fail = None
     host, port = recording_server.server_address
     # Keep a developer's HTTP(S)_PROXY from routing these past the recorder.
     monkeypatch.setenv("NO_PROXY", host)
@@ -1359,3 +1368,140 @@ class TestScoreKindComesFromTheResponse:
             "vector",
             pytest.approx(0.5845972299575806),
         )
+
+
+# honeyhive's @trace calls the traced function a second time, untraced, when
+# the exception it caught contains "Tracer error". GoodMem errors carry the
+# server's message, which can echo request content, so without a guard a
+# failed write whose error text held that phrase was sent twice.
+TRACER_ERROR_BODY = b'{"message": "Tracer error: upstream embedder rejected the write"}'
+WRITES = {
+    "create_memory": (
+        ("POST", "/v1/memories"),
+        lambda c: c.create_memory(space_id=SPACE_ID, text_content="hello"),
+    ),
+    "delete_memory": (("DELETE", "/v1/memories/"), lambda c: c.delete_memory(VICTIM)),
+    "delete_space": (("DELETE", "/v1/spaces/"), lambda c: c.delete_space(VICTIM)),
+    "create_space": (
+        ("POST", "/v1/spaces"),
+        lambda c: c.create_space("tracer-error-space", VICTIM),
+    ),
+}
+
+
+@pytest.mark.filterwarnings(
+    "ignore:You should use instrumentation_scope:DeprecationWarning"
+)
+class TestTracerErrorRetryNeverRepeatsAWrite:
+    @pytest.mark.parametrize("label", sorted(WRITES))
+    def test_a_failed_write_is_sent_once(
+        self, honeyhive_spans, recording_server, recorded, label
+    ):
+        client, requests = recorded
+        (verb, prefix), call = WRITES[label]
+        recording_server.fail = (verb, prefix, 500, TRACER_ERROR_BODY)
+        result, exc = _call(lambda: call(client))
+        sent = [(v, p) for v, p, _ in requests if v == verb and p.startswith(prefix)]
+        assert len(sent) == 1, f"{label} was sent {len(sent)} times: {sent}"
+        assert result is None and isinstance(exc, GoodMemError)
+        assert "Tracer error" in str(exc)
+
+    def test_a_successful_write_is_not_repeated_by_a_retry(self):
+        # Drive the guard the way honeyhive's retry does: call the traced
+        # function a second time within the same call.
+        from honeyhive_goodmem import _tracing
+
+        calls = []
+
+        def fake_trace(**_kw):
+            def wrap(func):
+                def run(*a, **k):
+                    first = func(*a, **k)
+                    second = func(*a, **k)  # a retry after a tracer failure
+                    assert second is first
+                    return first
+
+                return run
+
+            return wrap
+
+        original = _tracing.trace
+        _tracing.trace = fake_trace
+        try:
+
+            @_tracing.traced(event_type="tool", event_name="t")
+            def write(x):
+                calls.append(x)
+                return {"written": x}
+
+            assert write(1) == {"written": 1}
+            assert write(2) == {"written": 2}
+        finally:
+            _tracing.trace = original
+        assert calls == [1, 2]
+
+
+class TestEveryRefusalIsAGoodMemError:
+    """No input, however odd, escapes as anything but GoodMemError."""
+
+    def test_a_uuid_whose_int_slot_raises(self, recorded):
+        import uuid as _uuid
+
+        class IndexRaises:
+            def __index__(self):
+                raise RuntimeError("boom")
+
+        client, requests = recorded
+        bad = _uuid.UUID(VICTIM)
+        object.__setattr__(bad, "int", IndexRaises())
+        with pytest.raises(GoodMemError, match="must be a UUID"):
+            client.delete_memory(bad)
+        assert requests == []
+
+    @pytest.mark.parametrize("raised", [RuntimeError, KeyError])
+    def test_an_iterable_that_raises(self, recorded, raised):
+        class IterRaises:
+            def __iter__(self):
+                raise raised("boom")
+
+        client, requests = recorded
+        with pytest.raises(GoodMemError, match="space_ids"):
+            client.retrieve_memories("q", IterRaises())
+        assert requests == []
+
+
+class TestGoodMemConfigTyping:
+    def test_the_stored_key_is_a_secretstr_whatever_was_passed(self):
+        import pydantic
+
+        from honeyhive_goodmem.types import SecretStr
+
+        accepted = (
+            "gm_offline_test_key",
+            SecretStr("gm_offline_test_key"),
+            pydantic.SecretStr("gm_offline_test_key"),
+        )
+        for key in accepted:
+            config = GoodMemConfig(base_url="https://x", api_key=key)
+            assert isinstance(config.api_key, SecretStr)
+            assert config.api_key.get_secret_value() == "gm_offline_test_key"
+            assert config.get_api_key() == "gm_offline_test_key"
+
+    def test_dataclass_helpers_still_work_and_never_show_the_key(self):
+        import dataclasses
+
+        config = GoodMemConfig(base_url="https://x", api_key="gm_offline_test_key")
+        copy = dataclasses.replace(config, timeout=5.0)
+        assert copy.timeout == 5.0 and copy.get_api_key() == "gm_offline_test_key"
+        assert "gm_offline_test_key" not in repr(dataclasses.asdict(config))
+        assert config == GoodMemConfig(
+            base_url="https://x", api_key="gm_offline_test_key"
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            config.timeout = 1.0  # type: ignore[misc]
+
+    def test_required_values_are_still_enforced(self):
+        with pytest.raises(ValueError, match="base_url"):
+            GoodMemConfig(base_url="", api_key="k")
+        with pytest.raises(ValueError, match="api_key"):
+            GoodMemConfig(base_url="https://x", api_key="")

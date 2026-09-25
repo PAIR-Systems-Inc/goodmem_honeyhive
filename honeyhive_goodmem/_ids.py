@@ -59,8 +59,11 @@ def _canonical(value: object) -> Optional[str]:
         if issubclass(kind, str):
             text = cast(str, value)
             return str.lower(text) if _UUID.fullmatch(text) else None
-    except (AttributeError, TypeError, ValueError):
-        # An uninitialised UUID, or a stored value that is not a 128-bit int.
+    except Exception:
+        # An uninitialised UUID, a stored value that is not a 128-bit int, or
+        # one whose __index__ raises: whatever it is, it is not an id we can
+        # vouch for, and the caller gets GoodMemError rather than the value's
+        # own exception.
         return None
     return None
 
@@ -125,4 +128,10 @@ def require_uuids(values: Any, field: str) -> list[str]:
         items = list(values)
     except TypeError:
         return [require_uuid(values, field)]
+    except Exception as error:
+        # An iterable whose __iter__/__next__ raises something else: refuse it
+        # through the normal error type, before any request is made.
+        raise GoodMemError(
+            f"{field} could not be read as a list of ids ({type(error).__name__})."
+        ) from error
     return [require_uuid(value, f"{field}[{i}]") for i, value in enumerate(items)]
