@@ -22,6 +22,10 @@ classifiers = [
 dependencies = [
     "honeyhive>=1.0.0rc21",
     "goodmem>=0.1.35",
+    # honeyhive imports requests at import time without declaring it; it used
+    # to arrive through opentelemetry-exporter-otlp-proto-http, which dropped
+    # it in 1.45.0, and `import honeyhive_goodmem` then fails.
+    "requests>=2.7",
 ]
 
 [project.optional-dependencies]

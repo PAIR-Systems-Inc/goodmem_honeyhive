@@ -531,7 +531,8 @@ class GoodMemClient:
             query: The natural-language query.
             space_ids: One space id or several. Each must be a UUID.
             max_results: How many chunks to ask the server for.
-            reranker_id: A reranker to apply, if any. Must be a UUID.
+            reranker_id: A reranker to apply, or ``None`` for none. Must be a
+                UUID; an empty string is refused, not read as ``None``.
             metadata_filter: Metadata every memory must match, applied
                 server-side and escaped by :mod:`honeyhive_goodmem.filters`.
 

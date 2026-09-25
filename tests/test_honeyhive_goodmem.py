@@ -698,3 +698,320 @@ class TestIdsNeverReachAPathUnchecked:
             require_uuid(bad, "memory_id")
         assert require_uuid(VICTIM.upper(), "memory_id") == VICTIM
         assert require_uuid(uuid.UUID(VICTIM), "memory_id") == VICTIM
+
+
+# ---------------------------------------------------------------------------
+# Ids that pass the check as one value and are sent as another
+# ---------------------------------------------------------------------------
+#
+# The first version of the check validated the caller's object but returned
+# str(value) for a uuid.UUID and value.lower() for a str -- both of which a
+# subclass can override. client.delete_memory(_UUIDWithLyingStr(VICTIM)) passed
+# the check and still sent DELETE /v1/spaces/<DECOY>. JSON, model output and
+# environment variables only ever produce a plain str, so this needs code in
+# the same process; the id that is sent must still be the one that was checked.
+
+TRAVERSAL = f"../spaces/{VICTIM}"
+# What the lying methods answer. A different space from VICTIM, so that for a
+# space_id argument the traversal cannot land on the intended path by luck.
+DECOY = "0199a8c0-5e1f-7c3a-9d2b-4f6e8a1b2c3d"
+LIE = f"../spaces/{DECOY}"
+
+
+class _UUIDWithLyingStr(uuid.UUID):
+    def __str__(self) -> str:
+        return LIE
+
+    def __format__(self, spec: str) -> str:
+        return LIE
+
+    @property
+    def hex(self) -> str:  # type: ignore[override]
+        return LIE
+
+
+class _UUIDWithLyingInt(uuid.UUID):
+    @property
+    def int(self) -> int:  # type: ignore[override]
+        return -1
+
+
+def _uuid_with_lying_int() -> uuid.UUID:
+    # uuid.UUID.__init__ cannot assign through the property, so fill the
+    # slot the way __init__ would.
+    made = object.__new__(_UUIDWithLyingInt)
+    vars(uuid.UUID)["int"].__set__(made, uuid.UUID(VICTIM).int)
+    object.__setattr__(made, "is_safe", uuid.SafeUUID.unknown)
+    return made
+
+
+class _StrWithLyingMethods(str):
+    def lower(self) -> str:  # type: ignore[override]
+        return LIE
+
+    def __str__(self) -> str:
+        return LIE
+
+    def __format__(self, spec: str) -> str:
+        return LIE
+
+
+class _StrThatClaimsToBeTheVictim(str):
+    """Holds a traversal, but every overridable method answers VICTIM."""
+
+    def lower(self) -> str:  # type: ignore[override]
+        return VICTIM
+
+    def __str__(self) -> str:
+        return VICTIM
+
+    def __format__(self, spec: str) -> str:
+        return VICTIM
+
+    def __repr__(self) -> str:
+        return repr(VICTIM)
+
+
+class _PosesAsUUID:
+    """Not a UUID at all, but isinstance(x, uuid.UUID) answers True."""
+
+    @property  # type: ignore[misc]
+    def __class__(self):  # type: ignore[override]
+        return uuid.UUID
+
+    def __str__(self) -> str:
+        return TRAVERSAL
+
+
+class _PosesAsStr:
+    """Not a str at all, but isinstance(x, str) answers True."""
+
+    @property  # type: ignore[misc]
+    def __class__(self):  # type: ignore[override]
+        return str
+
+    def __str__(self) -> str:
+        return TRAVERSAL
+
+
+class _ReprRaises:
+    def __repr__(self) -> str:
+        raise RuntimeError("repr refused")
+
+
+# The real id sits in each of these; only its methods lie about it.
+HONEST_DATA = {
+    "uuid-str-lies": lambda: _UUIDWithLyingStr(VICTIM),
+    "uuid-int-lies": _uuid_with_lying_int,
+    "str-methods-lie": lambda: _StrWithLyingMethods(VICTIM),
+    "str-methods-lie-upper": lambda: _StrWithLyingMethods(VICTIM.upper()),
+}
+
+# None of these holds a UUID, whatever its methods or its __class__ say.
+DISHONEST_DATA = {
+    "poses-as-uuid": _PosesAsUUID,
+    "poses-as-str": _PosesAsStr,
+    "str-holding-traversal": lambda: _StrThatClaimsToBeTheVictim(TRAVERSAL),
+    "uninitialised-uuid": lambda: object.__new__(uuid.UUID),
+    "repr-raises": _ReprRaises,
+}
+
+
+class TestTheIdSentIsTheIdChecked:
+    @pytest.mark.parametrize("make", list(HONEST_DATA))
+    @pytest.mark.parametrize("label", list(ENTRY_POINTS))
+    def test_a_subclass_sends_its_own_data_not_what_its_methods_say(
+        self, recorded, label, make
+    ):
+        client, requests = recorded
+        _, _, call, expected = ENTRY_POINTS[label]
+        result, exc = _call(lambda: call(client, HONEST_DATA[make]()))
+        sent = [(verb, urlsplit(path).path) for verb, path, _ in requests]
+        assert sent == [
+            (verb, path.format(u=VICTIM)) for verb, path in expected
+        ], f"{label} with {make} sent {sent}; it returned {result!r} / {exc!r}"
+        assert exc is None
+        for _, path, body in requests:
+            assert DECOY not in path and DECOY.encode() not in body
+            assert b".." not in body and b"/spaces/" not in body
+        if expected[-1][0] == "POST":
+            # A body-carried id is the real one, not what a method made up.
+            assert VICTIM.encode() in requests[-1][2]
+
+    @pytest.mark.parametrize("make", list(DISHONEST_DATA))
+    @pytest.mark.parametrize("label", list(ENTRY_POINTS))
+    def test_an_object_that_lies_about_its_type_is_refused(self, recorded, label, make):
+        client, requests = recorded
+        _, param, call, _ = ENTRY_POINTS[label]
+        result, exc = _call(lambda: call(client, DISHONEST_DATA[make]()))
+        sent = [f"{verb} {path}" for verb, path, _ in requests]
+        assert sent == [], f"{label} with {make} reached the server as {sent}"
+        assert isinstance(exc, GoodMemError), f"not refused cleanly: {exc!r}"
+        assert param in str(exc) and "must be a UUID" in str(exc)
+        assert result is None
+
+    @pytest.mark.parametrize("make", list(HONEST_DATA))
+    def test_the_validator_returns_a_new_exact_str(self, make):
+        from honeyhive_goodmem._ids import require_uuid, require_uuids
+
+        given = HONEST_DATA[make]()
+        out = require_uuid(given, "memory_id")
+        assert type(out) is str and out == VICTIM
+        (listed,) = require_uuids([given], "space_ids")
+        assert type(listed) is str and listed == VICTIM
+        (single,) = require_uuids(given, "space_ids")
+        assert type(single) is str and single == VICTIM
+
+    @pytest.mark.parametrize("make", list(DISHONEST_DATA))
+    def test_the_validator_refuses_with_its_own_error(self, make):
+        from honeyhive_goodmem._ids import require_uuid
+
+        with pytest.raises(GoodMemError, match=r"^memory_id must be a UUID"):
+            require_uuid(DISHONEST_DATA[make](), "memory_id")
+
+    def test_a_uuid_whose_stored_value_is_out_of_range_is_refused(self):
+        from honeyhive_goodmem._ids import require_uuid
+
+        broken = uuid.UUID(VICTIM)
+        object.__setattr__(broken, "int", 1 << 130)
+        with pytest.raises(GoodMemError, match=r"^memory_id must be a UUID"):
+            require_uuid(broken, "memory_id")
+
+
+# ---------------------------------------------------------------------------
+# With a HoneyHive tracer active
+# ---------------------------------------------------------------------------
+#
+# Every method is wrapped in honeyhive's @trace. With a tracer active that
+# wrapper records the call's inputs, and it runs the method a second time,
+# untraced, when the exception text contains "Tracer error". A refusal must
+# still send nothing, reach the caller, and show up in the trace as an error.
+
+
+@pytest.fixture(scope="class")
+def honeyhive_spans(recording_server):
+    """An offline HoneyHive tracer whose spans land in memory."""
+    from honeyhive import HoneyHiveTracer
+    from honeyhive.tracer import registry
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    host, port = recording_server.server_address
+    tracer = HoneyHiveTracer.init(
+        api_key="hh_offline_test_key",
+        # Anything HoneyHive itself sent would be recorded -- and counted.
+        server_url=f"http://{host}:{port}",
+        test_mode=True,
+        disable_batch=True,
+    )
+    exporter = InMemorySpanExporter()
+    tracer.provider.add_span_processor(SimpleSpanProcessor(exporter))
+    yield exporter
+    registry.clear_registry()
+    exporter.shutdown()
+
+
+# retrieve() returns a structured outcome and is not traced itself.
+TRACED = [label for label, (method, *_) in ENTRY_POINTS.items() if method != "retrieve"]
+
+
+@pytest.mark.filterwarnings(
+    "ignore:You should use instrumentation_scope:DeprecationWarning"
+)
+class TestRefusalsUnderAnActiveTracer:
+    @pytest.mark.parametrize(
+        "bad", [TRAVERSAL, f"Tracer error/../../spaces/{VICTIM}"], ids=repr
+    )
+    @pytest.mark.parametrize("label", TRACED)
+    def test_a_refusal_sends_nothing_and_is_an_error_span(
+        self, honeyhive_spans, recorded, label, bad
+    ):
+        client, requests = recorded
+        honeyhive_spans.clear()
+        method, param, call, _ = ENTRY_POINTS[label]
+        result, exc = _call(lambda: call(client, bad))
+        assert [f"{verb} {path}" for verb, path, _ in requests] == []
+        assert isinstance(exc, GoodMemError) and param in str(exc)
+        assert result is None
+
+        spans = {s.name: s for s in honeyhive_spans.get_finished_spans()}
+        event = f"goodmem.{method}"
+        assert event in spans, f"no span for {event}: {sorted(spans)}"
+        assert spans[event].status.status_code.name == "ERROR"
+        recorded_types = {
+            str((e.attributes or {}).get("exception.type", ""))
+            for e in spans[event].events
+            if e.name == "exception"
+        }
+        assert any(t.endswith("GoodMemError") for t in recorded_types)
+        if "Tracer error" in bad:
+            # honeyhive ran the method again, untraced, and it refused again:
+            # still nothing sent, and no separate error span.
+            assert f"{event}_error" not in spans
+        else:
+            error = spans[f"{event}_error"].attributes or {}
+            assert error.get("honeyhive_error_type") == "GoodMemError"
+            assert "must be a UUID" in str(error.get("honeyhive_error"))
+
+    @pytest.mark.parametrize("label", TRACED)
+    def test_a_valid_id_is_an_ordinary_span(self, honeyhive_spans, recorded, label):
+        client, requests = recorded
+        honeyhive_spans.clear()
+        method, _, call, expected = ENTRY_POINTS[label]
+        call(client, VICTIM)
+        sent = [(verb, urlsplit(path).path) for verb, path, _ in requests]
+        assert sent == [(verb, path.format(u=VICTIM)) for verb, path in expected]
+        spans = {s.name: s for s in honeyhive_spans.get_finished_spans()}
+        assert spans[f"goodmem.{method}"].status.status_code.name != "ERROR"
+        assert not [name for name in spans if name.endswith("_error")]
+
+
+# ---------------------------------------------------------------------------
+# Packaging and README facts
+# ---------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class TestPackaging:
+    def test_requests_is_declared(self):
+        """honeyhive 1.6.0 imports requests at import time without declaring it.
+
+        It used to arrive through opentelemetry-exporter-otlp-proto-http,
+        which made it an optional extra in 1.45.0; after that, CI's own
+        install (pip install -e . pytest httpx ...) could not import this
+        package at all.
+        """
+        import tomllib
+
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+        names = {
+            re.split(r"[\s<>=!~;\[]", requirement, maxsplit=1)[0].lower()
+            for requirement in project["dependencies"]
+        }
+        assert "requests" in names
+
+    def test_readme_names_the_license_that_ships(self):
+        license_name = (ROOT / "LICENSE").read_text().splitlines()[0]
+        assert license_name == "MIT License"
+        pyproject = (ROOT / "pyproject.toml").read_text()
+        assert "License :: OSI Approved :: MIT License" in pyproject
+        section = (ROOT / "README.md").read_text().split("\n## License\n", 1)[1]
+        assert "MIT" in section and "Apache" not in section
+
+
+class TestOptionalReranker:
+    def test_none_means_no_reranker(self, recorded):
+        client, requests = recorded
+        client.retrieve_memories("q", [SPACE_ID], reranker_id=None)
+        (body,) = [json.loads(b) for _, _, b in requests]
+        assert "reranker" not in json.dumps(body).lower()
+
+    def test_an_empty_string_is_refused_not_read_as_none(self, recorded):
+        """0.2.0 treated "" as "no reranker"; it is now a non-UUID id."""
+        client, requests = recorded
+        with pytest.raises(GoodMemError, match=r"^reranker_id must be a UUID"):
+            client.retrieve_memories("q", [SPACE_ID], reranker_id="")
+        assert requests == []

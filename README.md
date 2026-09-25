@@ -45,7 +45,9 @@ client = GoodMemClient(
 
 Both GoodMem settings fall back to `GOODMEM_BASE_URL` and `GOODMEM_API_KEY`.
 Without a tracer the methods still run; HoneyHive logs that no tracer is
-active and no span is emitted.
+active and no span is emitted. With a tracer, a call that raises
+`GoodMemError` — a refused id included — is an error span carrying the
+exception.
 
 ## What a retrieval span records
 
@@ -131,7 +133,12 @@ Every id argument (`space_id`, `memory_id`, `embedder_id`, `space_ids`,
 unescaped and a value such as `../spaces/<id>` would otherwise address a
 different resource. Anything else raises `GoodMemError` before a request is
 made; upper-case UUIDs and `uuid.UUID` objects are accepted and sent in
-lower case.
+lower case. What is sent is a new plain string built from the id's own
+characters (or a `uuid.UUID`'s stored value), never the object passed in, so
+a `str` or `uuid.UUID` subclass cannot change it through `lower()` or
+`__str__`. `reranker_id` is optional: leave it `None` for no reranker. An
+empty string is refused like any other non-UUID, so
+`os.getenv("RERANKER_ID", "")` needs `or None`.
 
 ## Changes in 0.2.1
 
@@ -145,6 +152,9 @@ SDK and `httpx`:
 | Other malformed ids were sent too: `%2e%2e/spaces/<id>` and `..%2Fspaces%2F<id>` verbatim (the GoodMem server normalises `%2e%2e` into a traversal), `" <id>"` as `%20<id>`, `<id>?x=1` with a query string, `<id>#frag` as `<id>`, `None` as `/None` | Refused |
 | Non-UUID `space_ids`, `embedder_id` and `reranker_id` reached request bodies | Refused, by the same check |
 | 145 of the 166 bad-id cases in the new regression suite reached the server; 136 of them came back as success | 0 reach the server |
+| `retrieve_memories(..., reranker_id="")` meant "no reranker" | Refused as a non-UUID id; pass `None` (the default) instead |
+| A `uuid.UUID` or `str` subclass whose `__str__`, `__format__` or `lower()` returned `../spaces/<id>`, or an object whose `__class__` property claimed to be `uuid.UUID`, was sent as that path: `delete_memory` sent `DELETE /v1/spaces/<id>` and returned `success: True`. The first draft of this fix checked such an object but still sent what its methods returned | The id sent is a new plain string rebuilt from the characters or stored value that were checked, then checked again; such an object is sent as its real id or refused |
+| `pip install -e .` into a fresh environment could not `import honeyhive_goodmem`: `honeyhive` imports `requests` without declaring it, and `opentelemetry-exporter-otlp-proto-http` 1.45.0 stopped pulling it in | `requests` is declared here |
 
 ## Changes in 0.2.0
 
@@ -173,7 +183,7 @@ and the error path — the server's own message reaches the caller.
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/test_honeyhive_goodmem.py` | 234 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server |
+| `tests/test_honeyhive_goodmem.py` | 410 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server; the span tests use HoneyHive's own tracer in test mode with an in-memory exporter |
 | `tests/test_honeyhive_goodmem_live.py` | 16 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
@@ -185,7 +195,8 @@ GOODMEM_API_KEY=... GOODMEM_BASE_URL=... \
   GOODMEM_TEST_EMBEDDER_ID=... \
   pytest tests/test_honeyhive_goodmem_live.py
 
-ruff check honeyhive_goodmem tests && mypy honeyhive_goodmem
+ruff check honeyhive_goodmem tests && ruff format --check honeyhive_goodmem tests
+mypy honeyhive_goodmem
 ```
 
 One offline test scans the tree for a credential-shaped string, so the defect
@@ -194,4 +205,4 @@ space per run and asserts, against a fresh listing, that it is gone.
 
 ## License
 
-Apache-2.0.
+MIT — see [LICENSE](LICENSE).
