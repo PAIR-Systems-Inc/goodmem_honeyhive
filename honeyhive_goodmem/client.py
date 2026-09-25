@@ -9,6 +9,10 @@ tool reported success for a search that had failed.
 Retrieval now carries ``partial`` and ``statuses`` in the traced payload, so
 a span shows what the server actually reported.
 
+Every id argument must be a UUID and is checked before any request is made:
+the SDK puts ids into URL paths raw, so ``delete_memory("../spaces/<id>")``
+used to delete a whole space. A refused id raises :class:`GoodMemError`.
+
 Example::
 
     from honeyhive import HoneyHiveTracer
@@ -25,14 +29,14 @@ import logging
 import os
 from typing import Any, Optional, Union
 
-from honeyhive import trace
-
 from ._filters import from_mapping
+from ._ids import require_uuid, require_uuids
 from ._results import (
     RetrievalOutcome,
     log_if_degraded,
     outcome_from_events,
 )
+from ._tracing import traced
 from .types import MIME_TYPES, GoodMemConfig, GoodMemError
 
 logger = logging.getLogger(__name__)
@@ -111,8 +115,10 @@ class GoodMemClient:
             api_key=os.environ.get("GOODMEM_API_KEY", ""),
         )
         self.base_url = (config.base_url or "").rstrip("/")
-        # Held privately: never an attribute a repr or a traced payload picks up.
-        self.__api_key = config.api_key
+        # The key is not kept here at all: it goes straight to the SDK client.
+        # GoodMemConfig holds it as a SecretStr, so a config that reaches a
+        # repr, a log line or HoneyHive's @trace input capture shows a mask.
+        api_key = config.get_api_key()
         self.verify_ssl = config.verify_ssl
         self.max_list_items = max_list_items
 
@@ -123,7 +129,7 @@ class GoodMemClient:
             missing = [
                 name
                 for name, value in (
-                    ("GOODMEM_API_KEY", config.api_key),
+                    ("GOODMEM_API_KEY", api_key),
                     ("GOODMEM_BASE_URL", self.base_url),
                 )
                 if not value
@@ -136,7 +142,7 @@ class GoodMemClient:
                 )
             self._client = Goodmem(
                 base_url=self.base_url,
-                api_key=config.api_key,
+                api_key=api_key,
                 timeout=config.timeout,
                 verify=config.verify_ssl,
             )
@@ -163,7 +169,7 @@ class GoodMemClient:
     # spaces
     # ------------------------------------------------------------------
 
-    @trace(event_type="tool", event_name="goodmem.create_space")
+    @traced(event_type="tool", event_name="goodmem.create_space")
     def create_space(self, name: str, embedder_id: str) -> dict[str, Any]:
         """Create a space, or reuse one whose embedder already matches.
 
@@ -180,9 +186,11 @@ class GoodMemClient:
             ``success``, ``space_id``, ``name``, ``embedder_id``, ``reused``.
 
         Raises:
-            GoodMemError: If a space of that name exists with a different
-                embedder, or if several spaces share the name.
+            GoodMemError: If ``embedder_id`` is not a UUID, if a space of
+                that name exists with a different embedder, or if several
+                spaces share the name.
         """
+        embedder_id = require_uuid(embedder_id, "embedder_id")
         existing = [
             s for s in self._list_spaces_raw() if str(getattr(s, "name", "")) == name
         ]
@@ -230,7 +238,7 @@ class GoodMemClient:
         except Exception as exc:
             raise _wrap(exc, "Listing spaces") from exc
 
-    @trace(event_type="tool", event_name="goodmem.list_spaces")
+    @traced(event_type="tool", event_name="goodmem.list_spaces")
     def list_spaces(self) -> dict[str, Any]:
         """List spaces, following pagination up to ``max_list_items``."""
         spaces = self._list_spaces_raw()
@@ -247,9 +255,10 @@ class GoodMemClient:
             "total_results": len(spaces),
         }
 
-    @trace(event_type="tool", event_name="goodmem.get_space")
+    @traced(event_type="tool", event_name="goodmem.get_space")
     def get_space(self, space_id: str) -> dict[str, Any]:
         """Fetch one space by id."""
+        space_id = require_uuid(space_id, "space_id")
         try:
             space = self._client.spaces.get(id=space_id)
         except Exception as exc:
@@ -262,7 +271,7 @@ class GoodMemClient:
             "labels": dict(getattr(space, "labels", None) or {}),
         }
 
-    @trace(event_type="tool", event_name="goodmem.update_space")
+    @traced(event_type="tool", event_name="goodmem.update_space")
     def update_space(
         self,
         space_id: str,
@@ -275,6 +284,7 @@ class GoodMemClient:
         ``public_read`` is deliberately gone: the server removed the field
         and answers ``400 Unrecognized field "publicRead"``.
         """
+        space_id = require_uuid(space_id, "space_id")
         request: dict[str, Any] = {}
         if name is not None:
             request["name"] = name
@@ -292,16 +302,17 @@ class GoodMemClient:
             "name": str(getattr(space, "name", "")),
         }
 
-    @trace(event_type="tool", event_name="goodmem.delete_space")
+    @traced(event_type="tool", event_name="goodmem.delete_space")
     def delete_space(self, space_id: str) -> dict[str, Any]:
         """Permanently delete a space and every memory in it."""
+        space_id = require_uuid(space_id, "space_id")
         try:
             self._client.spaces.delete(id=space_id)
         except Exception as exc:
             raise _wrap(exc, f"Deleting space {space_id}") from exc
         return {"success": True, "space_id": space_id}
 
-    @trace(event_type="tool", event_name="goodmem.list_embedders")
+    @traced(event_type="tool", event_name="goodmem.list_embedders")
     def list_embedders(self) -> dict[str, Any]:
         """List the embedder models available on the server."""
         try:
@@ -325,7 +336,7 @@ class GoodMemClient:
     # memories
     # ------------------------------------------------------------------
 
-    @trace(event_type="tool", event_name="goodmem.create_memory")
+    @traced(event_type="tool", event_name="goodmem.create_memory")
     def create_memory(
         self,
         space_id: str,
@@ -354,6 +365,7 @@ class GoodMemClient:
             ``success``, ``memory_id``, ``space_id``, ``status``,
             ``content_type``.
         """
+        space_id = require_uuid(space_id, "space_id")
         meta: dict[str, Any] = dict(metadata or {})
         if source:
             meta["source"] = source
@@ -387,7 +399,7 @@ class GoodMemClient:
             "content_type": content_type,
         }
 
-    @trace(event_type="tool", event_name="goodmem.get_memory")
+    @traced(event_type="tool", event_name="goodmem.get_memory")
     def get_memory(
         self, memory_id: str, include_content: bool = False
     ) -> dict[str, Any]:
@@ -398,6 +410,7 @@ class GoodMemClient:
         JSON-serialisable. A content fetch that fails is an error, not a
         successful result with a note in it.
         """
+        memory_id = require_uuid(memory_id, "memory_id")
         try:
             memory = self._client.memories.get(id=memory_id)
         except Exception as exc:
@@ -418,9 +431,10 @@ class GoodMemClient:
             )
         return result
 
-    @trace(event_type="tool", event_name="goodmem.list_memories")
+    @traced(event_type="tool", event_name="goodmem.list_memories")
     def list_memories(self, space_id: str) -> dict[str, Any]:
         """List memories in a space, following pagination."""
+        space_id = require_uuid(space_id, "space_id")
         try:
             memories = list(
                 self._client.memories.list(
@@ -444,9 +458,10 @@ class GoodMemClient:
             "total_results": len(memories),
         }
 
-    @trace(event_type="tool", event_name="goodmem.delete_memory")
+    @traced(event_type="tool", event_name="goodmem.delete_memory")
     def delete_memory(self, memory_id: str) -> dict[str, Any]:
         """Permanently delete a memory and everything derived from it."""
+        memory_id = require_uuid(memory_id, "memory_id")
         try:
             self._client.memories.delete(id=memory_id)
         except Exception as exc:
@@ -467,9 +482,11 @@ class GoodMemClient:
         metadata_filter: Optional[dict[str, Any]] = None,
     ) -> RetrievalOutcome:
         """Retrieve chunks relevant to a query, as a structured outcome."""
-        ids = [space_ids] if isinstance(space_ids, str) else list(space_ids)
+        ids = require_uuids(space_ids, "space_ids")
         if not ids:
             raise GoodMemError("At least one space id is required.")
+        if reranker_id is not None:
+            reranker_id = require_uuid(reranker_id, "reranker_id")
         expression = from_mapping(metadata_filter or {})
         keys: list[dict[str, Any]] = []
         for space_id in ids:
@@ -496,7 +513,7 @@ class GoodMemClient:
         log_if_degraded(outcome, "goodmem.retrieve_memories")
         return outcome
 
-    @trace(event_type="retrieval", event_name="goodmem.retrieve_memories")
+    @traced(event_type="retrieval", event_name="goodmem.retrieve_memories")
     def retrieve_memories(
         self,
         query: str,
@@ -513,9 +530,10 @@ class GoodMemClient:
 
         Args:
             query: The natural-language query.
-            space_ids: One space id or several.
+            space_ids: One space id or several. Each must be a UUID.
             max_results: How many chunks to ask the server for.
-            reranker_id: A reranker to apply, if any.
+            reranker_id: A reranker to apply, or ``None`` for none. Must be a
+                UUID; an empty string is refused, not read as ``None``.
             metadata_filter: Metadata every memory must match, applied
                 server-side and escaped by :mod:`honeyhive_goodmem.filters`.
 
