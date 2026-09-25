@@ -23,6 +23,10 @@ UNKNOWN_CODE = "UNKNOWN"
 #: Reported when the stream ended mid-line or carried an undecodable line.
 MALFORMED_STREAM_CODE = "MALFORMED_STREAM"
 
+#: The server's code for a requested reranker that did not run. The hits it
+#: still returns are the vector-stage hits, scored as negative distances.
+RERANKING_FAILED_CODE = "RERANKING_FAILED"
+
 
 @dataclass
 class RetrievalStatus:
@@ -128,6 +132,29 @@ class RetrievalOutcome:
         return "GoodMem reported a problem during retrieval -- " + "; ".join(parts)
 
 
+def reports_reranker_failure(status: RetrievalStatus) -> bool:
+    r"""Returns whether a status says the requested reranker did not run.
+
+    The server sends ``RERANKING_FAILED`` and, for a reranker id it cannot
+    find, also ``NOT_FOUND`` naming the reranker in ``details`` or in the
+    message. A ``NOT_FOUND`` about anything else does not count.
+
+    Args:
+        status (RetrievalStatus): A classified status from the stream.
+
+    Returns:
+        bool: ``True`` when the reranking stage failed.
+    """
+    if status.code == RERANKING_FAILED_CODE:
+        return True
+    if status.code != "NOT_FOUND":
+        return False
+    details = status.details or {}
+    if any("reranker" in str(key).lower() for key in details):
+        return True
+    return "reranker" in status.message.lower()
+
+
 def classify_status(raw_code: str | None, message: str) -> RetrievalStatus:
     r"""Classifies one status event from a retrieval stream.
 
@@ -196,8 +223,11 @@ def outcome_from_events(
 
     Args:
         events (Any): An iterable of retrieval events from the SDK.
-        reranked (bool): Whether a reranker was requested, which decides
-            whether scores are reranker scores or vector distances.
+        reranked (bool): Whether a reranker was requested. Scores are read as
+            reranker scores only if it was requested *and* the stream reports
+            no reranker failure (``RERANKING_FAILED``, or a ``NOT_FOUND`` for
+            the reranker): after such a failure the server still returns the
+            vector-stage hits, whose scores are negative distances.
             (default: :obj:`False`)
 
     Returns:
@@ -266,12 +296,17 @@ def outcome_from_events(
             text=str(_getattr_any(inner, "chunk_text", "chunkText") or ""),
             memory_id=memory_id,
             raw_score=raw_value,
-            score=orient_score(raw_value, reranked=reranked),
-            score_kind="reranker" if reranked else "vector",
         )
         pending.append((hit, memory_id))
 
+    # Decided from what the server reported, not from what was requested, and
+    # only once the whole stream is read: a failure status may follow the hits.
+    scored_by_reranker = reranked and not any(
+        reports_reranker_failure(s) for s in outcome.statuses
+    )
     for hit, memory_id in pending:
+        hit.score = orient_score(hit.raw_score, reranked=scored_by_reranker)
+        hit.score_kind = "reranker" if scored_by_reranker else "vector"
         mem = memories.get(memory_id) or {}
         if mem:
             hit.space_id = str(mem.get("spaceId") or mem.get("space_id") or "")

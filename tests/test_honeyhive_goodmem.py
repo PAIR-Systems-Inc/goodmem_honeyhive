@@ -1257,3 +1257,105 @@ class TestTheApiKeyNeverReachesASpan:
         assert {"user.lookup", "goodmem.get_space"} <= names
         assert SECRET not in self._attributes(honeyhive_spans)
         assert recording_server.api_keys == [SECRET]
+
+
+# ---------------------------------------------------------------------------
+# A reranker that failed does not turn vector scores into "reranker" scores
+# ---------------------------------------------------------------------------
+#
+# When a requested reranker fails, the server reports RERANKING_FAILED (and a
+# NOT_FOUND for the reranker) and still returns the VECTOR-scored hits:
+# negative distances. Deciding score_kind from the request labelled those
+# "reranker", left them un-negated (-0.58 reported as the score), and ranked
+# them upside down against any higher-is-better reading.
+
+RERANKER_ID = "00000000-0000-7000-8000-000000000000"
+
+
+def _retrieve_ok_with_score(score: float) -> bytes:
+    return fixture("retrieve_ok.ndjson").replace(
+        b'"relevanceScore":-0.5845972299575806', f'"relevanceScore":{score}'.encode()
+    )
+
+
+def _status_line(code: str, message: str, details: dict | None = None) -> bytes:
+    status: dict = {"code": code, "message": message}
+    if details is not None:
+        status["details"] = details
+    return json.dumps({"status": status}).encode() + b"\n"
+
+
+class TestScoreKindComesFromTheResponse:
+    def test_a_failed_reranker_leaves_vector_scores_oriented_as_vector(self):
+        c = make_client(retrieve_handler(fixture("retrieve_degraded_hits.ndjson")))
+        out = c.retrieve_memories("canary", [SPACE_ID], reranker_id=RERANKER_ID)
+        (hit,) = out["results"]
+        assert hit["raw_score"] == pytest.approx(-0.5845972299575806)
+        assert hit["score_kind"] == "vector"
+        assert hit["score"] == pytest.approx(0.5845972299575806)
+        assert out["partial"] is True
+        assert {"NOT_FOUND", "RERANKING_FAILED"} <= {s["code"] for s in out["statuses"]}
+
+    def test_the_structured_outcome_agrees(self):
+        c = make_client(retrieve_handler(fixture("retrieve_degraded_hits.ndjson")))
+        outcome = c.retrieve("canary", [SPACE_ID], reranker_id=RERANKER_ID)
+        assert [(h.score_kind, h.score) for h in outcome.hits] == [
+            ("vector", pytest.approx(0.5845972299575806))
+        ]
+        assert outcome.partial is True
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            _status_line("RERANKING_FAILED", "Reranker call timed out"),
+            _status_line(
+                "NOT_FOUND",
+                "Reranker validation failed: Reranker not found",
+                {"reranker_id": RERANKER_ID},
+            ),
+            _status_line("NOT_FOUND", "Reranker not found: " + RERANKER_ID),
+        ],
+        ids=["RERANKING_FAILED", "NOT_FOUND+details", "NOT_FOUND+message"],
+    )
+    def test_any_reranker_failure_status_means_vector_scores(self, status):
+        stream = status + _retrieve_ok_with_score(-0.2715)
+        c = make_client(retrieve_handler(stream))
+        out = c.retrieve_memories("q", [SPACE_ID], reranker_id=RERANKER_ID)
+        (hit,) = out["results"]
+        assert (hit["score_kind"], hit["score"]) == ("vector", pytest.approx(0.2715))
+        assert out["partial"] is True and out["statuses"]
+
+    def test_a_failure_reported_after_the_hits_still_counts(self):
+        stream = _retrieve_ok_with_score(-0.5947) + _status_line(
+            "RERANKING_FAILED", "late"
+        )
+        c = make_client(retrieve_handler(stream))
+        (hit,) = c.retrieve_memories("q", [SPACE_ID], reranker_id=RERANKER_ID)[
+            "results"
+        ]
+        assert (hit["score_kind"], hit["score"]) == ("vector", pytest.approx(0.5947))
+
+    def test_a_reranker_that_worked_keeps_reranker_scores(self):
+        c = make_client(retrieve_handler(_retrieve_ok_with_score(0.93)))
+        out = c.retrieve_memories("q", [SPACE_ID], reranker_id=RERANKER_ID)
+        (hit,) = out["results"]
+        assert (hit["score_kind"], hit["score"]) == ("reranker", pytest.approx(0.93))
+        assert out["partial"] is False
+
+    def test_an_unrelated_not_found_does_not_unlabel_reranker_scores(self):
+        stream = _status_line(
+            "NOT_FOUND", "Space not found", {"space_id": OTHER_SPACE_ID}
+        ) + _retrieve_ok_with_score(0.41)
+        c = make_client(retrieve_handler(stream))
+        out = c.retrieve_memories("q", [SPACE_ID], reranker_id=RERANKER_ID)
+        (hit,) = out["results"]
+        assert (hit["score_kind"], hit["score"]) == ("reranker", pytest.approx(0.41))
+        assert out["partial"] is True
+
+    def test_no_reranker_requested_is_always_vector(self):
+        c = make_client(retrieve_handler(fixture("retrieve_degraded_hits.ndjson")))
+        (hit,) = c.retrieve_memories("q", [SPACE_ID])["results"]
+        assert (hit["score_kind"], hit["score"]) == (
+            "vector",
+            pytest.approx(0.5845972299575806),
+        )

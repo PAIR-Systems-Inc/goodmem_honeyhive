@@ -116,6 +116,12 @@ Voyage `rerank-2.5` returned `0.27..0.93` and Jina `jina-reranker-v3` returned
 `-0.14..0.43`. There is therefore no default threshold anywhere in this
 package.
 
+`score_kind` records what the server did, not what was asked for. When a
+requested reranker fails, the server reports `RERANKING_FAILED` (and
+`NOT_FOUND` for a reranker id it cannot find) and still returns the
+vector-stage hits. Those hits are labelled `"vector"` and flipped like any
+other vector score, and the retrieval is `partial` with both statuses.
+
 ## Metadata filters
 
 Filters are expressions evaluated server-side, not SQL:
@@ -177,6 +183,7 @@ SDK and `httpx`:
 | A `uuid.UUID` or `str` subclass whose `__str__`, `__format__` or `lower()` returned `../spaces/<id>`, or an object whose `__class__` property claimed to be `uuid.UUID`, was sent as that path: `delete_memory` sent `DELETE /v1/spaces/<id>` and returned `success: True`. The first draft of this fix checked such an object but still sent what its methods returned | The id sent is a new plain string rebuilt from the characters or stored value that were checked, then checked again; such an object is sent as its real id or refused |
 | `pip install -e .` into a fresh environment could not `import honeyhive_goodmem`: `honeyhive` imports `requests` without declaring it, and `opentelemetry-exporter-otlp-proto-http` 1.45.0 stopped pulling it in | `requests` is declared here |
 | `GoodMemConfig` held `api_key` as a plain `str`, so `repr()`, `str()`, f-strings, `logger.warning("%s", config)` and `dataclasses.asdict()` all printed the key. A `@trace`-decorated function taking the config exported it to HoneyHive as the span attribute `honeyhive_inputs.config`. `GoodMemClient` also kept the raw key in `_GoodMemClient__api_key`, so `json.dumps(vars(client), default=str)` contained it | The key is held in a `SecretStr` that renders as `**********` in every one of those, including the span. The client keeps no copy. The server still receives the real key in `X-API-Key`; read it yourself with `config.get_api_key()` |
+| With a `reranker_id` whose reranker failed, the server's vector fallback hits were labelled `score_kind: "reranker"` and left un-negated, so a `-0.58` distance was reported as `score: -0.58` | `score_kind` comes from the response: after `RERANKING_FAILED` or a reranker `NOT_FOUND` the hits are `"vector"` and scored `0.58`. `partial` and both statuses are unchanged |
 
 ## Changes in 0.2.0
 
@@ -205,7 +212,7 @@ and the error path — the server's own message reaches the caller.
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/test_honeyhive_goodmem.py` | 442 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server; the span tests use HoneyHive's own tracer in test mode with an in-memory exporter |
+| `tests/test_honeyhive_goodmem.py` | 451 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server; the span tests use HoneyHive's own tracer in test mode with an in-memory exporter |
 | `tests/test_honeyhive_goodmem_live.py` | 16 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash
