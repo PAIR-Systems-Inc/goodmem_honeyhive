@@ -116,8 +116,10 @@ class GoodMemClient:
             api_key=os.environ.get("GOODMEM_API_KEY", ""),
         )
         self.base_url = (config.base_url or "").rstrip("/")
-        # Held privately: never an attribute a repr or a traced payload picks up.
-        self.__api_key = config.api_key
+        # The key is not kept here at all: it goes straight to the SDK client.
+        # GoodMemConfig holds it as a SecretStr, so a config that reaches a
+        # repr, a log line or HoneyHive's @trace input capture shows a mask.
+        api_key = config.get_api_key()
         self.verify_ssl = config.verify_ssl
         self.max_list_items = max_list_items
 
@@ -128,7 +130,7 @@ class GoodMemClient:
             missing = [
                 name
                 for name, value in (
-                    ("GOODMEM_API_KEY", config.api_key),
+                    ("GOODMEM_API_KEY", api_key),
                     ("GOODMEM_BASE_URL", self.base_url),
                 )
                 if not value
@@ -141,7 +143,7 @@ class GoodMemClient:
                 )
             self._client = Goodmem(
                 base_url=self.base_url,
-                api_key=config.api_key,
+                api_key=api_key,
                 timeout=config.timeout,
                 verify=config.verify_ssl,
             )

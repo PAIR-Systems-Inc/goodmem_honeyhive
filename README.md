@@ -22,7 +22,10 @@ calls they feed.
 > **Security (0.2.1).** Every id argument must now be a UUID. In 0.2.0 the
 > GoodMem SDK put ids into URL paths raw, so `delete_memory("../spaces/<id>")`
 > sent `DELETE /v1/spaces/<id>`, deleted a whole space and returned
-> `success: True`. See [Changes in 0.2.1](#changes-in-021).
+> `success: True`. And `GoodMemConfig` printed its API key: HoneyHive's
+> `@trace` records a traced function's arguments with `str()`, so a function
+> that took the config exported the key to HoneyHive. It is now masked
+> everywhere. See [Changes in 0.2.1](#changes-in-021).
 
 ## Install
 
@@ -44,6 +47,24 @@ client = GoodMemClient(
 ```
 
 Both GoodMem settings fall back to `GOODMEM_BASE_URL` and `GOODMEM_API_KEY`.
+
+`GoodMemConfig` stores the key as a `SecretStr` (a `str` or a
+`pydantic.SecretStr` is accepted too). `repr()`, `str()`, f-strings, logging,
+`dataclasses.asdict()` and `json.dumps(..., default=str)` all show
+`**********`, and so does the span of a `@trace`-decorated function of yours
+that takes the config as an argument. `GoodMemClient` does not keep the key
+itself; it goes straight to the SDK, which sends it as `X-API-Key`. When you
+need the raw value, ask for it:
+
+```python
+config = GoodMemConfig(base_url="https://your-goodmem-server", api_key="<your-goodmem-key>")
+print(config)                  # GoodMemConfig(..., api_key=SecretStr('**********'), ...)
+raw = config.get_api_key()     # or config.api_key.get_secret_value()
+```
+
+`config.api_key` is no longer a `str`, so passing it straight to an HTTP
+library raises `TypeError` rather than sending the mask; use `get_api_key()`.
+
 Without a tracer the methods still run; HoneyHive logs that no tracer is
 active and no span is emitted. With a tracer, a call that raises
 `GoodMemError` — a refused id included — is an error span carrying the
@@ -155,6 +176,7 @@ SDK and `httpx`:
 | `retrieve_memories(..., reranker_id="")` meant "no reranker" | Refused as a non-UUID id; pass `None` (the default) instead |
 | A `uuid.UUID` or `str` subclass whose `__str__`, `__format__` or `lower()` returned `../spaces/<id>`, or an object whose `__class__` property claimed to be `uuid.UUID`, was sent as that path: `delete_memory` sent `DELETE /v1/spaces/<id>` and returned `success: True`. The first draft of this fix checked such an object but still sent what its methods returned | The id sent is a new plain string rebuilt from the characters or stored value that were checked, then checked again; such an object is sent as its real id or refused |
 | `pip install -e .` into a fresh environment could not `import honeyhive_goodmem`: `honeyhive` imports `requests` without declaring it, and `opentelemetry-exporter-otlp-proto-http` 1.45.0 stopped pulling it in | `requests` is declared here |
+| `GoodMemConfig` held `api_key` as a plain `str`, so `repr()`, `str()`, f-strings, `logger.warning("%s", config)` and `dataclasses.asdict()` all printed the key. A `@trace`-decorated function taking the config exported it to HoneyHive as the span attribute `honeyhive_inputs.config`. `GoodMemClient` also kept the raw key in `_GoodMemClient__api_key`, so `json.dumps(vars(client), default=str)` contained it | The key is held in a `SecretStr` that renders as `**********` in every one of those, including the span. The client keeps no copy. The server still receives the real key in `X-API-Key`; read it yourself with `config.get_api_key()` |
 
 ## Changes in 0.2.0
 
@@ -183,7 +205,7 @@ and the error path — the server's own message reaches the caller.
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/test_honeyhive_goodmem.py` | 410 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server; the span tests use HoneyHive's own tracer in test mode with an in-memory exporter |
+| `tests/test_honeyhive_goodmem.py` | 442 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server; the span tests use HoneyHive's own tracer in test mode with an in-memory exporter |
 | `tests/test_honeyhive_goodmem_live.py` | 16 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash

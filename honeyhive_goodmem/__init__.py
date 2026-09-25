@@ -17,7 +17,7 @@ from honeyhive_goodmem._results import (
     RetrievalStatus,
 )
 from honeyhive_goodmem.client import GoodMemClient
-from honeyhive_goodmem.types import GoodMemConfig, GoodMemError
+from honeyhive_goodmem.types import GoodMemConfig, GoodMemError, SecretStr
 
 __version__ = "0.2.1"
 
@@ -26,6 +26,7 @@ __all__ = [
     "GoodMemConfig",
     "GoodMemError",
     "GoodMemFilterError",
+    "SecretStr",
     "RetrievalHit",
     "RetrievalOutcome",
     "RetrievalStatus",

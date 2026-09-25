@@ -491,6 +491,7 @@ class _Recorder(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length") or 0)
         body = self.rfile.read(length) if length else b""
         self.server.requests.append((self.command, self.path, body))  # type: ignore[attr-defined]
+        self.server.api_keys.append(self.headers.get("X-API-Key"))  # type: ignore[attr-defined]
         status, content_type, payload = _reply(self.command, urlsplit(self.path).path)
         self.send_response(status)
         self.send_header("content-type", content_type)
@@ -508,6 +509,7 @@ class _Recorder(BaseHTTPRequestHandler):
 def recording_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Recorder)
     server.requests = []  # type: ignore[attr-defined]
+    server.api_keys = []  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield server
@@ -519,6 +521,7 @@ def recording_server():
 def recorded(recording_server, monkeypatch):
     """A client built the ordinary way, pointed at the recording server."""
     recording_server.requests.clear()
+    recording_server.api_keys.clear()
     host, port = recording_server.server_address
     # Keep a developer's HTTP(S)_PROXY from routing these past the recorder.
     monkeypatch.setenv("NO_PROXY", host)
@@ -1015,3 +1018,242 @@ class TestOptionalReranker:
         with pytest.raises(GoodMemError, match=r"^reranker_id must be a UUID"):
             client.retrieve_memories("q", [SPACE_ID], reranker_id="")
         assert requests == []
+
+
+# ---------------------------------------------------------------------------
+# The API key never appears in a rendering of the config or the client
+# ---------------------------------------------------------------------------
+#
+# Up to 0.2.1's first cut, GoodMemConfig was a plain frozen dataclass holding
+# api_key as a str, so repr(), str(), an f-string, logging's "%s" and
+# dataclasses.asdict() all carried the key. HoneyHive's @trace records every
+# argument of a decorated function with str(), so a user's
+# `@trace def build_client(config)` exported the key to HoneyHive as the span
+# attribute honeyhive_inputs.config. GoodMemClient also kept the raw key in
+# _GoodMemClient__api_key, which vars(client) exposes.
+
+SECRET = "gm_secret_never_rendered_0123"
+
+
+def _secret_config(base_url: str = BASE, api_key: object = SECRET) -> GoodMemConfig:
+    return GoodMemConfig(base_url=base_url, api_key=api_key)  # type: ignore[arg-type]
+
+
+def _logged(config: GoodMemConfig) -> str:
+    import io
+    import logging
+
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    log = logging.getLogger("honeyhive_goodmem.tests.secret")
+    log.addHandler(handler)
+    try:
+        log.warning("connecting with %s", config)
+        log.warning("connecting with %r", config)
+    finally:
+        log.removeHandler(handler)
+    return buffer.getvalue()
+
+
+CONFIG_RENDERINGS = {
+    "repr": repr,
+    "str": str,
+    "f-string": lambda c: f"{c}",
+    "format-spec": lambda c: f"{c!s:>80}{c.api_key!s:>40}",
+    "percent": lambda c: "%s %r" % (c, c),
+    "logging": _logged,
+    "asdict": lambda c: str(__import__("dataclasses").asdict(c)),
+    "astuple": lambda c: str(__import__("dataclasses").astuple(c)),
+    "asdict-json": lambda c: json.dumps(
+        __import__("dataclasses").asdict(c), default=str
+    ),
+    "vars-json": lambda c: json.dumps(vars(c), default=str),
+    "field-repr": lambda c: repr(c.api_key),
+    "field-str": lambda c: str(c.api_key),
+    "field-f-string": lambda c: f"{c.api_key}",
+    "field-json": lambda c: json.dumps({"k": c.api_key}, default=str),
+}
+
+
+class TestTheApiKeyIsNeverRendered:
+    @pytest.mark.parametrize("how", CONFIG_RENDERINGS)
+    def test_a_config_rendering_never_contains_the_key(self, how):
+        rendered = CONFIG_RENDERINGS[how](_secret_config())
+        assert SECRET not in rendered, f"{how} leaked the key: {rendered}"
+
+    @pytest.mark.parametrize("how", ["repr", "str", "asdict", "logging"])
+    def test_the_rendering_still_says_a_key_is_set(self, how):
+        rendered = CONFIG_RENDERINGS[how](_secret_config())
+        assert "api_key" in rendered or "**********" in rendered
+        assert "**********" in rendered
+
+    @pytest.mark.parametrize("injected", [False, True], ids=["built", "injected"])
+    def test_no_client_attribute_carries_the_key(self, injected):
+        if injected:
+            client = make_client(retrieve_handler(b""))
+            secret = "gm_offline_test_key"
+        else:
+            client = GoodMemClient(_secret_config())
+            secret = SECRET
+        try:
+            assert secret not in json.dumps(vars(client), default=str)
+            assert secret not in json.dumps(vars(client), default=repr)
+            assert secret not in repr(client) and secret not in str(client)
+            assert not [k for k in vars(client) if "api_key" in k]
+        finally:
+            client.close()
+
+    def test_the_raw_key_is_still_reachable_on_purpose(self):
+        config = _secret_config()
+        assert config.api_key.get_secret_value() == SECRET
+        assert type(config.api_key.get_secret_value()) is str
+        assert config.get_api_key() == SECRET
+
+    def test_equal_configs_compare_and_hash_equal(self):
+        import dataclasses
+
+        a, b = _secret_config(), _secret_config()
+        assert a == b and hash(a) == hash(b)
+        assert a != _secret_config(api_key="gm_another_key")
+        again = dataclasses.replace(a, timeout=5.0)
+        assert again.get_api_key() == SECRET and again.timeout == 5.0
+        assert dataclasses.asdict(a)["api_key"].get_secret_value() == SECRET
+
+    def test_a_config_survives_pickle_and_deepcopy(self):
+        import copy
+        import pickle
+
+        config = _secret_config()
+        assert pickle.loads(pickle.dumps(config)).get_api_key() == SECRET
+        assert copy.deepcopy(config).get_api_key() == SECRET
+
+    def test_an_empty_key_is_still_refused(self):
+        with pytest.raises(ValueError, match="api_key is required"):
+            _secret_config(api_key="")
+
+    def test_a_non_string_key_is_refused(self):
+        with pytest.raises(TypeError, match="api_key must be a str"):
+            _secret_config(api_key=12345)
+
+    def test_the_mask_cannot_be_sent_as_a_header(self):
+        """A caller who hands the wrapper itself to an HTTP library gets an
+        error, not a request authenticated with ``**********``."""
+        with pytest.raises(TypeError):
+            httpx.Headers({"X-API-Key": _secret_config().api_key})  # type: ignore[dict-item]
+
+
+class TestTheRealKeyStillReachesTheServer:
+    def _built(self, recording_server, monkeypatch, api_key):
+        recording_server.requests.clear()
+        recording_server.api_keys.clear()
+        host, port = recording_server.server_address
+        monkeypatch.setenv("NO_PROXY", host)
+        monkeypatch.setenv("no_proxy", host)
+        return GoodMemClient(
+            _secret_config(base_url=f"http://{host}:{port}", api_key=api_key)
+        )
+
+    def test_a_str_key_is_sent_as_the_x_api_key_header(
+        self, recording_server, monkeypatch
+    ):
+        with self._built(recording_server, monkeypatch, SECRET) as client:
+            client.get_space(SPACE_ID)
+            client.retrieve_memories("q", [SPACE_ID])
+        assert recording_server.api_keys == [SECRET, SECRET]
+
+    def test_a_wrapped_key_is_sent_as_the_x_api_key_header(
+        self, recording_server, monkeypatch
+    ):
+        from honeyhive_goodmem import SecretStr
+
+        with self._built(recording_server, monkeypatch, SecretStr(SECRET)) as client:
+            client.get_space(SPACE_ID)
+        assert recording_server.api_keys == [SECRET]
+
+    def test_a_pydantic_secret_is_accepted_and_sent(
+        self, recording_server, monkeypatch
+    ):
+        from pydantic import SecretStr as PydanticSecretStr
+
+        config_key = PydanticSecretStr(SECRET)
+        with self._built(recording_server, monkeypatch, config_key) as client:
+            client.get_space(SPACE_ID)
+        assert recording_server.api_keys == [SECRET]
+
+    def test_the_environment_fallback_sends_the_real_key(
+        self, recording_server, monkeypatch
+    ):
+        host, port = recording_server.server_address
+        monkeypatch.setenv("GOODMEM_BASE_URL", f"http://{host}:{port}")
+        monkeypatch.setenv("GOODMEM_API_KEY", SECRET)
+        monkeypatch.setenv("NO_PROXY", host)
+        monkeypatch.setenv("no_proxy", host)
+        recording_server.api_keys.clear()
+        with GoodMemClient() as client:
+            client.get_space(SPACE_ID)
+            assert SECRET not in json.dumps(vars(client), default=str)
+        assert recording_server.api_keys == [SECRET]
+
+
+@pytest.mark.filterwarnings(
+    "ignore:You should use instrumentation_scope:DeprecationWarning"
+)
+class TestTheApiKeyNeverReachesASpan:
+    """HoneyHive's @trace records each argument with str() -- check the span."""
+
+    def _attributes(self, exporter) -> str:
+        spans = exporter.get_finished_spans()
+        attributes = [dict(s.attributes or {}) for s in spans]
+        events = [dict(e.attributes or {}) for s in spans for e in s.events]
+        return json.dumps(attributes + events, default=str)
+
+    def test_a_traced_function_receiving_the_config(
+        self, honeyhive_spans, recording_server, monkeypatch
+    ):
+        from honeyhive import trace
+
+        host, port = recording_server.server_address
+        monkeypatch.setenv("NO_PROXY", host)
+        monkeypatch.setenv("no_proxy", host)
+        honeyhive_spans.clear()
+
+        @trace(event_type="tool", event_name="user.build_client")
+        def build_client(config: GoodMemConfig) -> GoodMemClient:
+            return GoodMemClient(config)
+
+        client = build_client(
+            _secret_config(base_url=f"http://{host}:{port}", api_key=SECRET)
+        )
+        client.close()
+        spans = {s.name: s for s in honeyhive_spans.get_finished_spans()}
+        captured = (spans["user.build_client"].attributes or {}).get(
+            "honeyhive_inputs.config"
+        )
+        assert captured is not None, "honeyhive did not record the argument"
+        assert "GoodMemConfig" in str(captured)
+        assert SECRET not in str(captured)
+        assert SECRET not in self._attributes(honeyhive_spans)
+
+    def test_traced_methods_and_a_traced_caller_holding_the_client(
+        self, honeyhive_spans, recording_server, monkeypatch
+    ):
+        from honeyhive import trace
+
+        host, port = recording_server.server_address
+        monkeypatch.setenv("NO_PROXY", host)
+        monkeypatch.setenv("no_proxy", host)
+        honeyhive_spans.clear()
+        recording_server.api_keys.clear()
+
+        @trace(event_type="chain", event_name="user.lookup")
+        def lookup(client: GoodMemClient, space_id: str) -> dict:
+            return client.get_space(space_id)
+
+        with GoodMemClient(
+            _secret_config(base_url=f"http://{host}:{port}", api_key=SECRET)
+        ) as client:
+            lookup(client, SPACE_ID)
+        names = {s.name for s in honeyhive_spans.get_finished_spans()}
+        assert {"user.lookup", "goodmem.get_space"} <= names
+        assert SECRET not in self._attributes(honeyhive_spans)
+        assert recording_server.api_keys == [SECRET]
