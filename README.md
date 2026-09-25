@@ -5,7 +5,7 @@ operations. Every call appears as a span alongside the rest of your agent's
 work, so memory reads and writes are visible in the same trace as the model
 calls they feed.
 
-**Version 0.2.0.** Verified against GoodMem server **v1.0.320**.
+**Version 0.2.1.** Verified against GoodMem server **v1.0.320**.
 
 > **Upgrading from 0.1.0.** This is an observability package, which makes
 > 0.1.0's worst defect specific to it: retrieval statuses were dropped, so a
@@ -18,6 +18,11 @@ calls they feed.
 > value, on the public default branch and in the `v0.1.0` tag. It is removed
 > here and the environment variable is now required with no fallback — but
 > removing it from the tree does not un-leak it. **That key needs rotating.**
+
+> **Security (0.2.1).** Every id argument must now be a UUID. In 0.2.0 the
+> GoodMem SDK put ids into URL paths raw, so `delete_memory("../spaces/<id>")`
+> sent `DELETE /v1/spaces/<id>`, deleted a whole space and returned
+> `success: True`. See [Changes in 0.2.1](#changes-in-021).
 
 ## Install
 
@@ -121,6 +126,26 @@ nothing.
 `update_space` takes `name` and `labels`. It no longer offers `public_read`:
 the server removed that field and answers `400 Unrecognized field "publicRead"`.
 
+Every id argument (`space_id`, `memory_id`, `embedder_id`, `space_ids`,
+`reranker_id`) must be a UUID, because the SDK places ids into URL paths
+unescaped and a value such as `../spaces/<id>` would otherwise address a
+different resource. Anything else raises `GoodMemError` before a request is
+made; upper-case UUIDs and `uuid.UUID` objects are accepted and sent in
+lower case.
+
+## Changes in 0.2.1
+
+Measured against a local server that records every request, driving the real
+SDK and `httpx`:
+
+| Was (0.2.0) | Now |
+| --- | --- |
+| `delete_memory("../spaces/<id>")` sent `DELETE /v1/spaces/<id>` and returned `success: True` — a whole space deleted through a memory call | Refused with `GoodMemError: memory_id must be a UUID ...`; nothing is sent |
+| `a/../../spaces/<id>` and `<id>/../../spaces/<id>` were resolved the same way by `get_space`, `update_space`, `delete_space`, `list_memories`, `get_memory`, `delete_memory` | Refused, every entry point |
+| Other malformed ids were sent too: `%2e%2e/spaces/<id>` and `..%2Fspaces%2F<id>` verbatim (the GoodMem server normalises `%2e%2e` into a traversal), `" <id>"` as `%20<id>`, `<id>?x=1` with a query string, `<id>#frag` as `<id>`, `None` as `/None` | Refused |
+| Non-UUID `space_ids`, `embedder_id` and `reranker_id` reached request bodies | Refused, by the same check |
+| 145 of the 166 bad-id cases in the new regression suite reached the server; 136 of them came back as success | 0 reach the server |
+
 ## Changes in 0.2.0
 
 Reproduced against the published 0.1.0 wheel, live against GoodMem v1.0.320.
@@ -148,7 +173,7 @@ and the error path — the server's own message reaches the caller.
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/test_honeyhive_goodmem.py` | 33 | nothing — the real SDK over a mock transport, fed NDJSON captured from a live server |
+| `tests/test_honeyhive_goodmem.py` | 234 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server |
 | `tests/test_honeyhive_goodmem_live.py` | 16 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
 
 ```bash

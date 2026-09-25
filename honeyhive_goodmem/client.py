@@ -9,6 +9,10 @@ tool reported success for a search that had failed.
 Retrieval now carries ``partial`` and ``statuses`` in the traced payload, so
 a span shows what the server actually reported.
 
+Every id argument must be a UUID and is checked before any request is made:
+the SDK puts ids into URL paths raw, so ``delete_memory("../spaces/<id>")``
+used to delete a whole space. A refused id raises :class:`GoodMemError`.
+
 Example::
 
     from honeyhive import HoneyHiveTracer
@@ -28,6 +32,7 @@ from typing import Any, Optional, Union
 from honeyhive import trace
 
 from ._filters import from_mapping
+from ._ids import require_uuid, require_uuids
 from ._results import (
     RetrievalOutcome,
     log_if_degraded,
@@ -180,9 +185,11 @@ class GoodMemClient:
             ``success``, ``space_id``, ``name``, ``embedder_id``, ``reused``.
 
         Raises:
-            GoodMemError: If a space of that name exists with a different
-                embedder, or if several spaces share the name.
+            GoodMemError: If ``embedder_id`` is not a UUID, if a space of
+                that name exists with a different embedder, or if several
+                spaces share the name.
         """
+        embedder_id = require_uuid(embedder_id, "embedder_id")
         existing = [
             s for s in self._list_spaces_raw() if str(getattr(s, "name", "")) == name
         ]
@@ -250,6 +257,7 @@ class GoodMemClient:
     @trace(event_type="tool", event_name="goodmem.get_space")
     def get_space(self, space_id: str) -> dict[str, Any]:
         """Fetch one space by id."""
+        space_id = require_uuid(space_id, "space_id")
         try:
             space = self._client.spaces.get(id=space_id)
         except Exception as exc:
@@ -275,6 +283,7 @@ class GoodMemClient:
         ``public_read`` is deliberately gone: the server removed the field
         and answers ``400 Unrecognized field "publicRead"``.
         """
+        space_id = require_uuid(space_id, "space_id")
         request: dict[str, Any] = {}
         if name is not None:
             request["name"] = name
@@ -295,6 +304,7 @@ class GoodMemClient:
     @trace(event_type="tool", event_name="goodmem.delete_space")
     def delete_space(self, space_id: str) -> dict[str, Any]:
         """Permanently delete a space and every memory in it."""
+        space_id = require_uuid(space_id, "space_id")
         try:
             self._client.spaces.delete(id=space_id)
         except Exception as exc:
@@ -354,6 +364,7 @@ class GoodMemClient:
             ``success``, ``memory_id``, ``space_id``, ``status``,
             ``content_type``.
         """
+        space_id = require_uuid(space_id, "space_id")
         meta: dict[str, Any] = dict(metadata or {})
         if source:
             meta["source"] = source
@@ -398,6 +409,7 @@ class GoodMemClient:
         JSON-serialisable. A content fetch that fails is an error, not a
         successful result with a note in it.
         """
+        memory_id = require_uuid(memory_id, "memory_id")
         try:
             memory = self._client.memories.get(id=memory_id)
         except Exception as exc:
@@ -421,6 +433,7 @@ class GoodMemClient:
     @trace(event_type="tool", event_name="goodmem.list_memories")
     def list_memories(self, space_id: str) -> dict[str, Any]:
         """List memories in a space, following pagination."""
+        space_id = require_uuid(space_id, "space_id")
         try:
             memories = list(
                 self._client.memories.list(
@@ -447,6 +460,7 @@ class GoodMemClient:
     @trace(event_type="tool", event_name="goodmem.delete_memory")
     def delete_memory(self, memory_id: str) -> dict[str, Any]:
         """Permanently delete a memory and everything derived from it."""
+        memory_id = require_uuid(memory_id, "memory_id")
         try:
             self._client.memories.delete(id=memory_id)
         except Exception as exc:
@@ -467,9 +481,11 @@ class GoodMemClient:
         metadata_filter: Optional[dict[str, Any]] = None,
     ) -> RetrievalOutcome:
         """Retrieve chunks relevant to a query, as a structured outcome."""
-        ids = [space_ids] if isinstance(space_ids, str) else list(space_ids)
+        ids = require_uuids(space_ids, "space_ids")
         if not ids:
             raise GoodMemError("At least one space id is required.")
+        if reranker_id is not None:
+            reranker_id = require_uuid(reranker_id, "reranker_id")
         expression = from_mapping(metadata_filter or {})
         keys: list[dict[str, Any]] = []
         for space_id in ids:
@@ -513,9 +529,9 @@ class GoodMemClient:
 
         Args:
             query: The natural-language query.
-            space_ids: One space id or several.
+            space_ids: One space id or several. Each must be a UUID.
             max_results: How many chunks to ask the server for.
-            reranker_id: A reranker to apply, if any.
+            reranker_id: A reranker to apply, if any. Must be a UUID.
             metadata_filter: Metadata every memory must match, applied
                 server-side and escaped by :mod:`honeyhive_goodmem.filters`.
 

@@ -19,7 +19,7 @@ from honeyhive_goodmem._results import (
 from honeyhive_goodmem.client import GoodMemClient
 from honeyhive_goodmem.types import GoodMemConfig, GoodMemError
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "GoodMemClient",

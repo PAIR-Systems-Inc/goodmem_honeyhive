@@ -1,7 +1,8 @@
 """Offline tests for honeyhive-goodmem.
 
 These drive the *real* GoodMem SDK over an ``httpx`` mock transport, fed with
-NDJSON and JSON captured from a live GoodMem server (v1.0.320).
+NDJSON and JSON captured from a live GoodMem server (v1.0.320). The id tests
+go further and send real HTTP to a local server that records every request.
 
 0.1.0 shipped no offline tests at all: its 13 "tests" hit a live server and
 silently fell back to a real API key committed in the file, so they passed on
@@ -10,9 +11,14 @@ the author's machine and told nobody anything about the defects.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
+import threading
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -34,6 +40,14 @@ from honeyhive_goodmem._results import (
 
 FIXTURES = Path(__file__).parent / "goodmem_fixtures"
 BASE = "https://goodmem.test"
+
+# Real ids from the captured fixtures. Every GoodMem id is a UUID, and the
+# client refuses anything else before a request is made.
+SPACE_ID = "01a0d44b-746f-775b-b91e-bc73d4058e27"
+OTHER_SPACE_ID = "01a0d44b-96ae-7081-bc16-5644e701222a"
+MEMORY_ID = "01a0d44b-748d-72eb-b54e-c3ea2d956927"
+EMB_A = "019cfd1c-c033-7517-b7de-f73941a0464b"
+EMB_B = "019e3d24-0763-70f5-9786-da6b30b90d2f"
 
 
 def fixture(name: str) -> bytes:
@@ -96,7 +110,7 @@ class TestRetrievalStatusContract:
     def test_a_degraded_retrieval_is_visible_in_the_traced_payload(self):
         """The whole point of this package: a span must not say success."""
         c = make_client(retrieve_handler(fixture("retrieve_degraded_hits.ndjson")))
-        payload = c.retrieve_memories("canary", ["s-1"])
+        payload = c.retrieve_memories("canary", [SPACE_ID])
         assert payload["partial"] is True
         assert payload["statuses"]
         assert payload["warning"]
@@ -104,7 +118,7 @@ class TestRetrievalStatusContract:
 
     def test_q4b_degraded_with_no_hits_is_flagged(self):
         c = make_client(retrieve_handler(fixture("retrieve_degraded_empty.ndjson")))
-        payload = c.retrieve_memories("nothing", ["s-1"])
+        payload = c.retrieve_memories("nothing", [SPACE_ID])
         assert payload["total_results"] == 0
         assert payload["partial"] is True and payload["statuses"]
 
@@ -119,13 +133,13 @@ class TestRetrievalStatusContract:
             + b"\n"
         )
         c = make_client(retrieve_handler(payload))
-        out = c.retrieve_memories("q", ["s-1"])
+        out = c.retrieve_memories("q", [SPACE_ID])
         assert [s["code"] for s in out["statuses"]] == [UNKNOWN_CODE]
         assert out["partial"] is True
 
     def test_a_clean_retrieval_is_not_partial(self):
         c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson")))
-        out = c.retrieve_memories("canary", ["s-1"])
+        out = c.retrieve_memories("canary", [SPACE_ID])
         assert out["partial"] is False
         assert out["statuses"] == []
         assert "warning" not in out
@@ -133,7 +147,7 @@ class TestRetrievalStatusContract:
     def test_a_truncated_stream_keeps_what_arrived(self):
         whole = fixture("retrieve_ok.ndjson")
         c = make_client(retrieve_handler(whole[: int(len(whole) * 0.6)]))
-        out = c.retrieve_memories("canary", ["s-1"])
+        out = c.retrieve_memories("canary", [SPACE_ID])
         assert out["partial"] is True
         assert MALFORMED_STREAM_CODE in {s["code"] for s in out["statuses"]}
 
@@ -141,7 +155,7 @@ class TestRetrievalStatusContract:
 class TestTracedPayloadShape:
     def test_results_carry_ids_score_and_metadata(self):
         c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson")))
-        hit = c.retrieve_memories("canary", ["s-1"])["results"][0]
+        hit = c.retrieve_memories("canary", [SPACE_ID])["results"][0]
         for key in (
             "chunk_id",
             "memory_id",
@@ -155,7 +169,7 @@ class TestTracedPayloadShape:
 
     def test_scores_are_oriented_with_the_raw_value_kept(self):
         c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson")))
-        hit = c.retrieve_memories("canary", ["s-1"])["results"][0]
+        hit = c.retrieve_memories("canary", [SPACE_ID])["results"][0]
         assert hit["raw_score"] < 0 and hit["score"] > 0
         assert hit["score"] == pytest.approx(-hit["raw_score"])
         assert hit["score_kind"] == "vector"
@@ -167,14 +181,14 @@ class TestTracedPayloadShape:
 
     def test_the_payload_is_json_serialisable(self):
         c = make_client(retrieve_handler(fixture("retrieve_degraded_hits.ndjson")))
-        json.dumps(c.retrieve_memories("canary", ["s-1"]))
+        json.dumps(c.retrieve_memories("canary", [SPACE_ID]))
 
     def test_no_relevance_threshold_is_sent_by_default(self):
         capture: dict = {}
         c = make_client(
             retrieve_handler(fixture("retrieve_ok.ndjson"), capture=capture)
         )
-        c.retrieve_memories("canary", ["s-1"])
+        c.retrieve_memories("canary", [SPACE_ID])
         assert "relevanceThreshold" not in json.dumps(capture["body"])
 
 
@@ -227,24 +241,27 @@ class TestSpaces:
         return t
 
     def test_reuse_requires_a_matching_embedder(self):
-        c = make_client(self._spaces([self._space("s-1", "notes", ["emb-a"])]))
+        c = make_client(self._spaces([self._space(SPACE_ID, "notes", [EMB_A])]))
         with pytest.raises(GoodMemError) as err:
-            c.create_space("notes", "emb-b")
-        assert "emb-a" in str(err.value) and "emb-b" in str(err.value)
+            c.create_space("notes", EMB_B)
+        assert EMB_A in str(err.value) and EMB_B in str(err.value)
 
     def test_reuse_with_a_match_succeeds(self):
-        c = make_client(self._spaces([self._space("s-1", "notes", ["emb-a"])]))
-        out = c.create_space("notes", "emb-a")
-        assert out["reused"] is True and out["space_id"] == "s-1"
+        c = make_client(self._spaces([self._space(SPACE_ID, "notes", [EMB_A])]))
+        out = c.create_space("notes", EMB_A)
+        assert out["reused"] is True and out["space_id"] == SPACE_ID
 
     def test_an_ambiguous_name_is_an_error(self):
         c = make_client(
             self._spaces(
-                [self._space("s-1", "n", ["e"]), self._space("s-2", "n", ["e"])]
+                [
+                    self._space(SPACE_ID, "n", [EMB_A]),
+                    self._space(OTHER_SPACE_ID, "n", [EMB_A]),
+                ]
             )
         )
         with pytest.raises(GoodMemError, match="refusing to guess"):
-            c.create_space("n", "e")
+            c.create_space("n", EMB_A)
 
     def test_listing_follows_pagination(self):
         p1 = json.loads(fixture("spaces_page1.json"))
@@ -289,7 +306,7 @@ class TestContentAndSecrets:
 
     def test_text_content_comes_back_as_text(self):
         out = make_client(self._handler(b"hello", "text/plain")).get_memory(
-            "m-1", include_content=True
+            MEMORY_ID, include_content=True
         )
         assert out["content"] == "hello" and out["content_encoding"] == "text"
 
@@ -298,7 +315,7 @@ class TestContentAndSecrets:
 
         pdf = b"%PDF-1.4\x00\xff"
         out = make_client(self._handler(pdf, "application/pdf")).get_memory(
-            "m-1", include_content=True
+            MEMORY_ID, include_content=True
         )
         json.dumps(out)
         assert base64.b64decode(out["content"]) == pdf
@@ -306,7 +323,7 @@ class TestContentAndSecrets:
     def test_a_failed_content_fetch_raises(self):
         c = make_client(self._handler(b'{"m":"gone"}', "application/json", 404))
         with pytest.raises(GoodMemError):
-            c.get_memory("m-1", include_content=True)
+            c.get_memory(MEMORY_ID, include_content=True)
 
     def test_the_api_key_is_not_in_repr(self):
         assert "gm_offline_test_key" not in repr(make_client(retrieve_handler(b"")))
@@ -346,7 +363,7 @@ class TestFilters:
         c = make_client(
             retrieve_handler(fixture("retrieve_ok.ndjson"), capture=capture)
         )
-        c.retrieve_memories("q", ["s-1"], metadata_filter={"tenant": "acme"})
+        c.retrieve_memories("q", [SPACE_ID], metadata_filter={"tenant": "acme"})
         assert (
             capture["body"]["spaceKeys"][0]["filter"]
             == "CAST(val('$.tenant') AS TEXT) = 'acme'"
@@ -406,3 +423,278 @@ class TestJoin:
             self._models([self._chunk("c1", "m", -0.2), self._chunk("c2", "m", -0.3)])
         )
         assert len(two.hits) == 2
+
+
+# ---------------------------------------------------------------------------
+# Ids that reach a URL path
+# ---------------------------------------------------------------------------
+#
+# The GoodMem SDK builds paths as f"/v1/memories/{id}" with the id raw, and
+# httpx resolves dot segments before sending. On 0.2.0,
+# delete_memory("../spaces/<id>") therefore sent DELETE /v1/spaces/<id> -- it
+# deleted a whole space and reported success. These tests drive the real SDK
+# and httpx over a real socket to a local server that records every request.
+
+VICTIM = "01a0d44b-96ae-7081-bc16-5644e701222a"
+
+NON_UUID_IDS = [
+    f"../spaces/{VICTIM}",
+    f"a/../../spaces/{VICTIM}",
+    f"%2e%2e/spaces/{VICTIM}",
+    f"..%2Fspaces%2F{VICTIM}",
+    f"{VICTIM}/../../spaces/{VICTIM}",
+    "",
+    f" {VICTIM}",
+    f"{VICTIM}?x=1",
+    f"{VICTIM}#frag",
+    # A regex anchored with `$` accepts a trailing newline; fullmatch does not.
+    f"{VICTIM}\n",
+    VICTIM.replace("-", ""),
+    None,
+]
+
+
+def _space_json(space_id: str) -> dict:
+    space = json.loads(fixture("spaces_page1.json"))["spaces"][0]
+    space["spaceId"] = space_id
+    return space
+
+
+def _reply(method: str, path: str) -> tuple[int, str, bytes]:
+    """A plausible GoodMem answer for every route the client uses."""
+    as_json = "application/json"
+    if method == "DELETE":
+        return 204, as_json, b""
+    if method == "POST" and path == "/v1/memories:retrieve":
+        return 200, "application/x-ndjson", fixture("retrieve_ok.ndjson")
+    if method == "POST" and path == "/v1/memories":
+        return 200, as_json, fixture("memory_get.json")
+    if method == "POST" and path == "/v1/spaces":
+        return 200, as_json, json.dumps(_space_json(SPACE_ID)).encode()
+    if method == "GET" and path == "/v1/spaces":
+        return 200, as_json, b'{"spaces": []}'
+    if method == "GET" and path.endswith("/memories"):
+        return 200, as_json, b'{"memories": []}'
+    if method == "GET" and path.endswith("/content"):
+        return 200, "text/plain", b"hello"
+    if method in {"GET", "PUT"} and path.startswith("/v1/spaces/"):
+        return 200, as_json, json.dumps(_space_json(path.split("/")[3])).encode()
+    if method == "GET" and path.startswith("/v1/memories/"):
+        return 200, as_json, fixture("memory_get.json")
+    return 404, as_json, b'{"message": "unexpected"}'
+
+
+class _Recorder(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _handle(self) -> None:
+        length = int(self.headers.get("content-length") or 0)
+        body = self.rfile.read(length) if length else b""
+        self.server.requests.append((self.command, self.path, body))  # type: ignore[attr-defined]
+        status, content_type, payload = _reply(self.command, urlsplit(self.path).path)
+        self.send_response(status)
+        self.send_header("content-type", content_type)
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _handle
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+@pytest.fixture(scope="module")
+def recording_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Recorder)
+    server.requests = []  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.fixture
+def recorded(recording_server, monkeypatch):
+    """A client built the ordinary way, pointed at the recording server."""
+    recording_server.requests.clear()
+    host, port = recording_server.server_address
+    # Keep a developer's HTTP(S)_PROXY from routing these past the recorder.
+    monkeypatch.setenv("NO_PROXY", host)
+    monkeypatch.setenv("no_proxy", host)
+    client = GoodMemClient(
+        GoodMemConfig(base_url=f"http://{host}:{port}", api_key="gm_offline_test_key")
+    )
+    yield client, recording_server.requests
+    client.close()
+
+
+# Every client method that takes an id, with the call that passes the id under
+# test and the requests a valid id must produce. Ids in a path are the
+# traversal risk; ids in a request body go through the same check anyway.
+#   label: (method, id parameter, call, [(verb, path)] for a valid id)
+ENTRY_POINTS = {
+    "get_space": (
+        "get_space",
+        "space_id",
+        lambda c, v: c.get_space(v),
+        [("GET", "/v1/spaces/{u}")],
+    ),
+    "update_space": (
+        "update_space",
+        "space_id",
+        lambda c, v: c.update_space(v, name="renamed"),
+        [("PUT", "/v1/spaces/{u}")],
+    ),
+    "delete_space": (
+        "delete_space",
+        "space_id",
+        lambda c, v: c.delete_space(v),
+        [("DELETE", "/v1/spaces/{u}")],
+    ),
+    "list_memories": (
+        "list_memories",
+        "space_id",
+        lambda c, v: c.list_memories(v),
+        [("GET", "/v1/spaces/{u}/memories")],
+    ),
+    "get_memory": (
+        "get_memory",
+        "memory_id",
+        lambda c, v: c.get_memory(v),
+        [("GET", "/v1/memories/{u}")],
+    ),
+    "get_memory+content": (
+        "get_memory",
+        "memory_id",
+        lambda c, v: c.get_memory(v, include_content=True),
+        [("GET", "/v1/memories/{u}"), ("GET", "/v1/memories/{u}/content")],
+    ),
+    "delete_memory": (
+        "delete_memory",
+        "memory_id",
+        lambda c, v: c.delete_memory(v),
+        [("DELETE", "/v1/memories/{u}")],
+    ),
+    "create_memory": (
+        "create_memory",
+        "space_id",
+        lambda c, v: c.create_memory(v, text_content="x"),
+        [("POST", "/v1/memories")],
+    ),
+    "create_space": (
+        "create_space",
+        "embedder_id",
+        lambda c, v: c.create_space("notes", v),
+        [("GET", "/v1/spaces"), ("POST", "/v1/spaces")],
+    ),
+    "retrieve_memories[list]": (
+        "retrieve_memories",
+        "space_ids",
+        lambda c, v: c.retrieve_memories("q", [SPACE_ID, v]),
+        [("POST", "/v1/memories:retrieve")],
+    ),
+    "retrieve_memories[str]": (
+        "retrieve_memories",
+        "space_ids",
+        lambda c, v: c.retrieve_memories("q", v),
+        [("POST", "/v1/memories:retrieve")],
+    ),
+    "retrieve_memories[reranker]": (
+        "retrieve_memories",
+        "reranker_id",
+        lambda c, v: c.retrieve_memories("q", [SPACE_ID], reranker_id=v),
+        [("POST", "/v1/memories:retrieve")],
+    ),
+    "retrieve[list]": (
+        "retrieve",
+        "space_ids",
+        lambda c, v: c.retrieve("q", [SPACE_ID, v]),
+        [("POST", "/v1/memories:retrieve")],
+    ),
+    "retrieve[reranker]": (
+        "retrieve",
+        "reranker_id",
+        lambda c, v: c.retrieve("q", [SPACE_ID], reranker_id=v),
+        [("POST", "/v1/memories:retrieve")],
+    ),
+}
+
+REFUSAL_CASES = [
+    pytest.param(label, bad, id=f"{label}-{bad!r}")
+    for label, (_, param, _, _) in ENTRY_POINTS.items()
+    for bad in NON_UUID_IDS
+    # reranker_id is optional: None means "no reranker", not a bad id.
+    if not (bad is None and param == "reranker_id")
+]
+
+
+def _call(fn):
+    try:
+        return fn(), None
+    except Exception as exc:
+        return None, exc
+
+
+class TestIdsNeverReachAPathUnchecked:
+    @pytest.mark.parametrize(("label", "bad"), REFUSAL_CASES)
+    def test_a_non_uuid_id_is_refused_before_any_request(self, recorded, label, bad):
+        client, requests = recorded
+        _, param, call, _ = ENTRY_POINTS[label]
+        result, exc = _call(lambda: call(client, bad))
+        sent = [f"{verb} {path}" for verb, path, _ in requests]
+        assert sent == [], (
+            f"{label} with {bad!r} reached the server as {sent}; "
+            f"it returned {result!r}"
+        )
+        assert isinstance(exc, GoodMemError), f"not refused: {exc!r}"
+        assert param in str(exc) and "must be a UUID" in str(exc)
+        assert result is None, "a refused call must not report success"
+
+    @pytest.mark.parametrize("given", [VICTIM, VICTIM.upper()], ids=["lower", "upper"])
+    @pytest.mark.parametrize("label", list(ENTRY_POINTS))
+    def test_a_valid_uuid_reaches_exactly_the_intended_path(
+        self, recorded, label, given
+    ):
+        client, requests = recorded
+        _, param, call, expected = ENTRY_POINTS[label]
+        call(client, given)
+        sent = [(verb, urlsplit(path).path) for verb, path, _ in requests]
+        assert sent == [(verb, path.format(u=VICTIM)) for verb, path in expected]
+        if expected[-1][0] == "POST":
+            # A body-carried id is sent in its canonical, lower-case form.
+            body = requests[-1][2].decode()
+            assert VICTIM in body and VICTIM.upper() not in body
+
+    def test_a_uuid_object_is_accepted(self, recorded):
+        client, requests = recorded
+        client.delete_memory(uuid.UUID(VICTIM))  # type: ignore[arg-type]
+        assert [(verb, path) for verb, path, _ in requests] == [
+            ("DELETE", f"/v1/memories/{VICTIM}")
+        ]
+
+    def test_every_id_parameter_is_covered(self):
+        """A new id-taking method must be added to ENTRY_POINTS above."""
+        covered = {(method, param) for method, param, _, _ in ENTRY_POINTS.values()}
+        found = set()
+        for name, fn in inspect.getmembers(GoodMemClient, inspect.isfunction):
+            if name.startswith("_"):
+                continue
+            for param in inspect.signature(fn).parameters:
+                if param.endswith(("_id", "_ids")):
+                    found.add((name, param))
+        assert found == covered
+
+    @pytest.mark.parametrize(
+        "bad",
+        [f"{{{VICTIM}}}", f"urn:uuid:{VICTIM}", VICTIM.encode(), 123, VICTIM[:-1]],
+        ids=repr,
+    )
+    def test_the_validator_accepts_only_the_canonical_form(self, bad):
+        from honeyhive_goodmem._ids import require_uuid
+
+        with pytest.raises(GoodMemError, match=r"^memory_id must be a UUID"):
+            require_uuid(bad, "memory_id")
+        assert require_uuid(VICTIM.upper(), "memory_id") == VICTIM
+        assert require_uuid(uuid.UUID(VICTIM), "memory_id") == VICTIM
