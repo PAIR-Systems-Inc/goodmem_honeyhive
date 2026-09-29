@@ -5,7 +5,7 @@ operations. Every call appears as a span alongside the rest of your agent's
 work, so memory reads and writes are visible in the same trace as the model
 calls they feed.
 
-**Version 0.2.1.** Verified against GoodMem server **v1.0.320**.
+**Version 0.3.0.** Verified against GoodMem server **v1.0.320**.
 
 > **Upgrading from 0.1.0.** This is an observability package, which makes
 > 0.1.0's worst defect specific to it: retrieval statuses were dropped, so a
@@ -124,6 +124,45 @@ requested reranker fails, the server reports `RERANKING_FAILED` (and
 vector-stage hits. Those hits are labelled `"vector"` and flipped like any
 other vector score, and the retrieval is `partial` with both statuses.
 
+## LLM answers (opt-in)
+
+GoodMem can run one of its configured LLMs over the chunks a retrieval found
+and send back a grounded answer. Ask for it by passing the LLM's id, the same
+way you pass `reranker_id`:
+
+```python
+out = client.retrieve_memories(
+    "What is HoneyHive?", ["<space-uuid>"], llm_id="<llm-uuid>"
+)
+out["abstract_reply"]   # "HoneyHive is an LLM observability platform built on ..."
+out["results"]          # the chunks the answer was drawn from, as always
+
+outcome = client.retrieve("What is HoneyHive?", ["<space-uuid>"], llm_id="<llm-uuid>")
+outcome.abstract_reply  # the same text on the RetrievalOutcome
+```
+
+- **Opt-in and set by you.** `llm_id` defaults to `None`, and then the request
+  is exactly what it was before: no post-processor, no LLM call. It is an
+  argument of your own code's call, not something a model chooses.
+- **Checked like every other id.** It must be a UUID; anything else,
+  including `""`, raises `GoodMemError` and nothing is sent. It travels in the
+  retrieval's post-processor config beside `reranker_id`, and both can be set.
+- **Where the answer appears.** `abstract_reply` in the traced payload, so
+  the HoneyHive `retrieval` span records it as
+  `honeyhive_outputs.result.abstract_reply`, and
+  `RetrievalOutcome.abstract_reply` from `retrieve(...)`. The key is absent
+  when no LLM was asked for or none answered.
+- **When the LLM fails, the retrieval still succeeds, flagged.** The server
+  reports `SUMMARIZATION_FAILED` (with `NOT_FOUND` first for an LLM id it does
+  not know). Nothing is raised: the hits are kept, `partial` is `True`, both
+  statuses are in `statuses` and `warning`, there is no `abstract_reply`, and
+  the span records exactly that. Measured live: an unknown id gave
+  `partial: True`, `[NOT_FOUND, SUMMARIZATION_FAILED]`, 1 hit; an LLM whose
+  provider answered `429` gave `[SUMMARIZATION_FAILED]`, 1 hit.
+- **Scores are untouched.** An LLM does not rerank: hits keep the
+  `score_kind` of the stage that scored them, and a failed LLM never changes
+  a reranker's scores into vector ones or back.
+
 ## Metadata filters
 
 Filters are expressions evaluated server-side, not SQL:
@@ -158,16 +197,23 @@ nothing.
 the server removed that field and answers `400 Unrecognized field "publicRead"`.
 
 Every id argument (`space_id`, `memory_id`, `embedder_id`, `space_ids`,
-`reranker_id`) must be a UUID, because the SDK places ids into URL paths
+`reranker_id`, `llm_id`) must be a UUID, because the SDK places ids into URL paths
 unescaped and a value such as `../spaces/<id>` would otherwise address a
 different resource. Anything else raises `GoodMemError` before a request is
 made; upper-case UUIDs and `uuid.UUID` objects are accepted and sent in
 lower case. What is sent is a new plain string built from the id's own
 characters (or a `uuid.UUID`'s stored value), never the object passed in, so
 a `str` or `uuid.UUID` subclass cannot change it through `lower()` or
-`__str__`. `reranker_id` is optional: leave it `None` for no reranker. An
-empty string is refused like any other non-UUID, so
+`__str__`. `reranker_id` and `llm_id` are optional: leave them `None` for no
+reranker and no LLM. An empty string is refused like any other non-UUID, so
 `os.getenv("RERANKER_ID", "")` needs `or None`.
+
+## Changes in 0.3.0
+
+| Was (0.2.x) | Now |
+| --- | --- |
+| 0.1.0's `llm_id` was dropped from `retrieve_memories` in 0.2.0 without a note, so `retrieve_memories(..., llm_id=...)` raised `TypeError: ... unexpected keyword argument 'llm_id'` and there was no way to get an LLM answer. The `abstractReply` parsing was already there and unreachable | `retrieve_memories(..., llm_id=...)` and `retrieve(..., llm_id=...)`, opt-in, checked as a UUID before anything is sent. The answer is `abstract_reply`, recorded on the retrieval span. See [LLM answers (opt-in)](#llm-answers-opt-in) |
+| — | An LLM that fails (`SUMMARIZATION_FAILED`, plus `NOT_FOUND` for an unknown id) keeps the hits and is `partial` with both statuses, never raised and never dropped |
 
 ## Changes in 0.2.1
 
@@ -217,8 +263,8 @@ and the error path — the server's own message reaches the caller.
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/test_honeyhive_goodmem.py` | 451 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server; the span tests use HoneyHive's own tracer in test mode with an in-memory exporter |
-| `tests/test_honeyhive_goodmem_live.py` | 16 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them |
+| `tests/test_honeyhive_goodmem.py` | 527 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server; the span tests use HoneyHive's own tracer in test mode with an in-memory exporter |
+| `tests/test_honeyhive_goodmem_live.py` | 20 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them. `GOODMEM_TEST_LLM_ID` (a working LLM) and `GOODMEM_TEST_FAILING_LLM_ID` (one whose provider fails) enable two of the LLM tests |
 
 ```bash
 pip install -e . pytest httpx "ruff==0.7.4" mypy
@@ -226,7 +272,7 @@ pip install -e . pytest httpx "ruff==0.7.4" mypy
 pytest tests/test_honeyhive_goodmem.py
 
 GOODMEM_API_KEY=... GOODMEM_BASE_URL=... \
-  GOODMEM_TEST_EMBEDDER_ID=... \
+  GOODMEM_TEST_EMBEDDER_ID=... GOODMEM_TEST_LLM_ID=... \
   pytest tests/test_honeyhive_goodmem_live.py
 
 ruff check honeyhive_goodmem tests && ruff format --check honeyhive_goodmem tests

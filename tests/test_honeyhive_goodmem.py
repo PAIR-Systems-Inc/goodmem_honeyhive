@@ -631,14 +631,26 @@ ENTRY_POINTS = {
         lambda c, v: c.retrieve("q", [SPACE_ID], reranker_id=v),
         [("POST", "/v1/memories:retrieve")],
     ),
+    "retrieve_memories[llm]": (
+        "retrieve_memories",
+        "llm_id",
+        lambda c, v: c.retrieve_memories("q", [SPACE_ID], llm_id=v),
+        [("POST", "/v1/memories:retrieve")],
+    ),
+    "retrieve[llm]": (
+        "retrieve",
+        "llm_id",
+        lambda c, v: c.retrieve("q", [SPACE_ID], llm_id=v),
+        [("POST", "/v1/memories:retrieve")],
+    ),
 }
 
 REFUSAL_CASES = [
     pytest.param(label, bad, id=f"{label}-{bad!r}")
     for label, (_, param, _, _) in ENTRY_POINTS.items()
     for bad in NON_UUID_IDS
-    # reranker_id is optional: None means "no reranker", not a bad id.
-    if not (bad is None and param == "reranker_id")
+    # reranker_id and llm_id are optional: None means "none", not a bad id.
+    if not (bad is None and param in {"reranker_id", "llm_id"})
 ]
 
 
@@ -1027,6 +1039,156 @@ class TestOptionalReranker:
         with pytest.raises(GoodMemError, match=r"^reranker_id must be a UUID"):
             client.retrieve_memories("q", [SPACE_ID], reranker_id="")
         assert requests == []
+
+
+# ---------------------------------------------------------------------------
+# Opt-in LLM post-processing
+# ---------------------------------------------------------------------------
+#
+# 0.1.0 took llm_id on retrieve_memories; 0.2.0 dropped it without a note, so
+# retrieve_memories(..., llm_id=...) raised TypeError and the abstractReply
+# parsing in _results.py could never be reached. The streams below were
+# captured live from GoodMem v1.0.320: a working LLM, an LLM id the server
+# does not know, and an LLM whose provider answered 429.
+
+LLM_ID = "019cfd9f-0963-76f9-b069-4cde19a64ba8"
+LLM_REPLY = "HoneyHive is an LLM observability platform built on OpenTelemetry"
+
+
+def _codes(payload: dict) -> list[str]:
+    return [s["code"] for s in payload["statuses"]]
+
+
+class TestOptionalLlm:
+    def test_none_means_no_llm_and_the_request_is_unchanged(self):
+        capture: dict = {}
+        c = make_client(
+            retrieve_handler(fixture("retrieve_ok.ndjson"), capture=capture)
+        )
+        c.retrieve_memories("q", [SPACE_ID], llm_id=None)
+        assert "llm" not in json.dumps(capture["body"]).lower()
+        assert "postProcessor" not in capture["body"]
+
+    def test_the_llm_id_is_sent_in_the_post_processor_config(self):
+        capture: dict = {}
+        c = make_client(
+            retrieve_handler(fixture("retrieve_llm_ok.ndjson"), capture=capture)
+        )
+        c.retrieve_memories("q", [SPACE_ID], llm_id=LLM_ID.upper())
+        config = capture["body"]["postProcessor"]["config"]
+        assert config["llm_id"] == LLM_ID
+        assert "reranker_id" not in config
+
+    def test_it_sits_beside_the_reranker_id(self):
+        capture: dict = {}
+        c = make_client(
+            retrieve_handler(fixture("retrieve_llm_ok.ndjson"), capture=capture)
+        )
+        c.retrieve("q", [SPACE_ID], reranker_id=RERANKER_ID, llm_id=LLM_ID)
+        config = capture["body"]["postProcessor"]["config"]
+        assert (config["reranker_id"], config["llm_id"]) == (RERANKER_ID, LLM_ID)
+
+    @pytest.mark.parametrize("method", ["retrieve_memories", "retrieve"])
+    @pytest.mark.parametrize("bad", ["", "not-a-uuid", f"../llms/{LLM_ID}"])
+    def test_a_non_uuid_llm_id_is_refused_before_any_request(
+        self, recorded, method, bad
+    ):
+        client, requests = recorded
+        with pytest.raises(GoodMemError, match=r"^llm_id must be a UUID"):
+            getattr(client, method)("q", [SPACE_ID], llm_id=bad)
+        assert requests == []
+
+    def test_the_abstract_reply_is_in_the_traced_payload(self):
+        c = make_client(retrieve_handler(fixture("retrieve_llm_ok.ndjson")))
+        out = c.retrieve_memories("What is HoneyHive?", [SPACE_ID], llm_id=LLM_ID)
+        assert out["abstract_reply"].startswith(LLM_REPLY)
+        assert out["partial"] is False and out["statuses"] == []
+        assert out["total_results"] == 1
+        json.dumps(out)
+
+    def test_the_structured_outcome_carries_the_reply_text(self):
+        c = make_client(retrieve_handler(fixture("retrieve_llm_ok.ndjson")))
+        outcome = c.retrieve("What is HoneyHive?", [SPACE_ID], llm_id=LLM_ID)
+        assert isinstance(outcome.abstract_reply, str)
+        assert outcome.abstract_reply.startswith(LLM_REPLY)
+        assert len(outcome.hits) == 1 and outcome.partial is False
+
+    def test_no_llm_means_no_abstract_reply_key(self):
+        c = make_client(retrieve_handler(fixture("retrieve_ok.ndjson")))
+        assert "abstract_reply" not in c.retrieve_memories("q", [SPACE_ID])
+
+    def test_an_unknown_llm_is_partial_with_both_statuses_and_hits_kept(self):
+        c = make_client(retrieve_handler(fixture("retrieve_llm_not_found.ndjson")))
+        out = c.retrieve_memories("q", [SPACE_ID], llm_id=LLM_ID)
+        assert out["partial"] is True
+        assert _codes(out) == ["NOT_FOUND", "SUMMARIZATION_FAILED"]
+        assert out["total_results"] == 1, "the hits were discarded"
+        assert "SUMMARIZATION_FAILED" in out["warning"]
+        assert "abstract_reply" not in out
+
+    def test_a_provider_failure_is_partial_and_keeps_the_hits(self):
+        c = make_client(retrieve_handler(fixture("retrieve_llm_rate_limited.ndjson")))
+        out = c.retrieve_memories("q", [SPACE_ID], llm_id=LLM_ID)
+        assert out["partial"] is True
+        assert _codes(out) == ["SUMMARIZATION_FAILED"]
+        assert "429" in out["statuses"][0]["message"]
+        assert out["total_results"] == 1 and "abstract_reply" not in out
+
+    def test_an_llm_does_not_relabel_vector_scores(self):
+        c = make_client(retrieve_handler(fixture("retrieve_llm_ok.ndjson")))
+        (hit,) = c.retrieve_memories("q", [SPACE_ID], llm_id=LLM_ID)["results"]
+        assert hit["score_kind"] == "vector"
+        assert hit["score"] == pytest.approx(-hit["raw_score"]) and hit["score"] > 0
+
+    def test_a_failed_llm_does_not_unlabel_reranker_scores(self):
+        """The LLM's NOT_FOUND names an llm_id, not the reranker."""
+        lines = fixture("retrieve_llm_not_found.ndjson").decode().splitlines()
+        statuses = "\n".join(line for line in lines if '"status"' in line) + "\n"
+        stream = statuses.encode() + _retrieve_ok_with_score(0.93)
+        c = make_client(retrieve_handler(stream))
+        out = c.retrieve_memories(
+            "q", [SPACE_ID], reranker_id=RERANKER_ID, llm_id=LLM_ID
+        )
+        (hit,) = out["results"]
+        assert (hit["score_kind"], hit["score"]) == ("reranker", pytest.approx(0.93))
+        assert out["partial"] is True
+        assert _codes(out) == ["NOT_FOUND", "SUMMARIZATION_FAILED"]
+
+
+@pytest.mark.filterwarnings(
+    "ignore:You should use instrumentation_scope:DeprecationWarning"
+)
+class TestTheRetrievalSpanRecordsTheLlm:
+    def _span(self, exporter) -> dict:
+        (span,) = [
+            s
+            for s in exporter.get_finished_spans()
+            if s.name == "goodmem.retrieve_memories"
+        ]
+        assert span.status.status_code.name != "ERROR"
+        return dict(span.attributes or {})
+
+    def test_the_span_records_the_abstract_reply(self, honeyhive_spans):
+        honeyhive_spans.clear()
+        c = make_client(retrieve_handler(fixture("retrieve_llm_ok.ndjson")))
+        c.retrieve_memories("What is HoneyHive?", [SPACE_ID], llm_id=LLM_ID)
+        attributes = self._span(honeyhive_spans)
+        reply = attributes.get("honeyhive_outputs.result.abstract_reply")
+        assert str(reply).startswith(LLM_REPLY)
+        assert attributes.get("honeyhive_outputs.result.partial") is False
+
+    def test_the_span_records_a_failed_llm_as_partial(self, honeyhive_spans):
+        honeyhive_spans.clear()
+        c = make_client(retrieve_handler(fixture("retrieve_llm_not_found.ndjson")))
+        c.retrieve_memories("q", [SPACE_ID], llm_id=LLM_ID)
+        attributes = self._span(honeyhive_spans)
+        assert attributes.get("honeyhive_outputs.result.partial") is True
+        recorded = [
+            attributes[f"honeyhive_outputs.result.statuses.{i}.code"] for i in (0, 1)
+        ]
+        assert recorded == ["NOT_FOUND", "SUMMARIZATION_FAILED"]
+        assert attributes.get("honeyhive_outputs.result.total_results") == 1
+        assert "honeyhive_outputs.result.abstract_reply" not in attributes
 
 
 # ---------------------------------------------------------------------------
