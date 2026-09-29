@@ -1,4 +1,4 @@
-"""Offline tests for honeyhive-goodmem.
+"""Offline tests for goodmem-honeyhive.
 
 These drive the *real* GoodMem SDK over an ``httpx`` mock transport, fed with
 NDJSON and JSON captured from a live GoodMem server (v1.0.320). The id tests

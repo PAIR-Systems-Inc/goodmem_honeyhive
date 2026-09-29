@@ -1,10 +1,10 @@
 [project]
-name = "honeyhive-goodmem"
+name = "goodmem-honeyhive"
 description = "GoodMem integration for HoneyHive."
 authors = [{ name = "GoodMem", email = "support@goodmem.ai" }]
 readme = "README.md"
 requires-python = ">=3.11"
-version = "0.3.0"
+version = "0.3.1"
 license-files = ["LICENSE"]
 urls.homepage = "https://github.com/PAIR-Systems-Inc/goodmem_honeyhive"
 urls.source = "https://github.com/PAIR-Systems-Inc/goodmem_honeyhive"
@@ -47,6 +47,11 @@ markers = [
 [build-system]
 requires = ["flit-core >= 3.11,<4.0"]
 build-backend = "flit_core.buildapi"
+
+# flit derives the module name from the distribution name, which is
+# goodmem-honeyhive; the import package stays honeyhive_goodmem.
+[tool.flit.module]
+name = "honeyhive_goodmem"
 
 [tool.ruff]
 line-length = 88

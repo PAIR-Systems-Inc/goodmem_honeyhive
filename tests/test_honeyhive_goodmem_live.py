@@ -1,4 +1,4 @@
-"""Live tests for honeyhive-goodmem, against a running GoodMem server.
+"""Live tests for goodmem-honeyhive, against a running GoodMem server.
 
 These skip entirely unless GOODMEM_API_KEY and GOODMEM_BASE_URL are set.
 0.1.0's suite fell back to a key committed in the file, so it ran whether or

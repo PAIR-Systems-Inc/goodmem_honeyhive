@@ -1,11 +1,20 @@
-# honeyhive-goodmem
+# goodmem-honeyhive
 
 [GoodMem](https://docs.goodmem.ai) memory as [HoneyHive](https://honeyhive.ai)-traced
 operations. Every call appears as a span alongside the rest of your agent's
 work, so memory reads and writes are visible in the same trace as the model
 calls they feed.
 
-**Version 0.3.0.** Verified against GoodMem server **v1.0.320**.
+**Version 0.3.1.** Verified against GoodMem server **v1.0.320**.
+
+> **Renamed on PyPI.** This package was previously published as
+> `honeyhive-goodmem` (last version on that name: 0.3.0). It moved into the
+> PAIR Systems PyPI organisation under the `goodmem-<framework>` naming used
+> by goodmem-adk and goodmem-semantic-kernel. The import name is unchanged:
+> `import honeyhive_goodmem`. Both distributions ship the same
+> `honeyhive_goodmem` package and overwrite each other's files, so remove the
+> old one first:
+> `pip uninstall -y honeyhive-goodmem && pip install goodmem-honeyhive`.
 
 > **Upgrading from 0.1.0.** This is an observability package, which makes
 > 0.1.0's worst defect specific to it: retrieval statuses were dropped, so a
@@ -30,7 +39,7 @@ calls they feed.
 ## Install
 
 ```bash
-pip install honeyhive-goodmem
+pip install goodmem-honeyhive
 ```
 
 ## Use
@@ -207,6 +216,14 @@ a `str` or `uuid.UUID` subclass cannot change it through `lower()` or
 `__str__`. `reranker_id` and `llm_id` are optional: leave them `None` for no
 reranker and no LLM. An empty string is refused like any other non-UUID, so
 `os.getenv("RERANKER_ID", "")` needs `or None`.
+
+## Changes in 0.3.1
+
+| Was (0.3.0) | Now |
+| --- | --- |
+| Published on PyPI as `honeyhive-goodmem` | Published as `goodmem-honeyhive`: moved into the PAIR Systems PyPI organisation under the `goodmem-<framework>` naming used by goodmem-adk and goodmem-semantic-kernel. `honeyhive-goodmem` stays at 0.3.0. Imports are unchanged (`import honeyhive_goodmem`); run `pip uninstall -y honeyhive-goodmem` before installing, since both ship the same package |
+
+No code changes.
 
 ## Changes in 0.3.0
 
