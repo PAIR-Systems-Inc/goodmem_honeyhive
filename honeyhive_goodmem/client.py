@@ -480,13 +480,21 @@ class GoodMemClient:
         max_results: int = 5,
         reranker_id: Optional[str] = None,
         metadata_filter: Optional[dict[str, Any]] = None,
+        llm_id: Optional[str] = None,
     ) -> RetrievalOutcome:
-        """Retrieve chunks relevant to a query, as a structured outcome."""
+        """Retrieve chunks relevant to a query, as a structured outcome.
+
+        Takes the same arguments as :meth:`retrieve_memories`. The LLM's
+        answer, when one was asked for and produced, is
+        ``RetrievalOutcome.abstract_reply``.
+        """
         ids = require_uuids(space_ids, "space_ids")
         if not ids:
             raise GoodMemError("At least one space id is required.")
         if reranker_id is not None:
             reranker_id = require_uuid(reranker_id, "reranker_id")
+        if llm_id is not None:
+            llm_id = require_uuid(llm_id, "llm_id")
         expression = from_mapping(metadata_filter or {})
         keys: list[dict[str, Any]] = []
         for space_id in ids:
@@ -502,6 +510,9 @@ class GoodMemClient:
         }
         if reranker_id:
             kwargs["reranker_id"] = reranker_id
+        if llm_id:
+            # The SDK puts it in the post-processor config beside reranker_id.
+            kwargs["llm_id"] = llm_id
         try:
             stream = self._client.memories.retrieve(**kwargs)
             with stream as events:
@@ -521,12 +532,14 @@ class GoodMemClient:
         max_results: int = 5,
         reranker_id: Optional[str] = None,
         metadata_filter: Optional[dict[str, Any]] = None,
+        llm_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Retrieve memories, as a traced payload.
 
         The returned dictionary is what a HoneyHive span records. It carries
         ``partial`` and ``statuses``, so a degraded retrieval is visible in
-        the trace instead of being recorded as a clean success.
+        the trace instead of being recorded as a clean success -- and that
+        includes an LLM that was asked for and failed.
 
         Args:
             query: The natural-language query.
@@ -536,11 +549,18 @@ class GoodMemClient:
                 UUID; an empty string is refused, not read as ``None``.
             metadata_filter: Metadata every memory must match, applied
                 server-side and escaped by :mod:`honeyhive_goodmem.filters`.
+            llm_id: A GoodMem LLM to answer the query from the retrieved
+                chunks, or ``None`` for none. Must be a UUID; an empty string
+                is refused, not read as ``None``. Its answer is
+                ``abstract_reply``. An LLM that fails does not raise: the
+                hits are kept and the retrieval is ``partial`` with the
+                server's statuses (``SUMMARIZATION_FAILED``, plus
+                ``NOT_FOUND`` for an id the server does not know).
 
         Returns:
             ``success``, ``query``, ``results``, ``total_results``,
-            ``partial``, ``statuses``, ``result_set_id`` and, when degraded,
-            ``warning``.
+            ``partial``, ``statuses``, ``result_set_id``, when degraded
+            ``warning``, and when the LLM produced one ``abstract_reply``.
         """
         outcome = self.retrieve(
             query,
@@ -548,6 +568,7 @@ class GoodMemClient:
             max_results=max_results,
             reranker_id=reranker_id,
             metadata_filter=metadata_filter,
+            llm_id=llm_id,
         )
         payload: dict[str, Any] = {
             "success": True,

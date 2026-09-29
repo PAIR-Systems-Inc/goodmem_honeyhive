@@ -137,7 +137,9 @@ def reports_reranker_failure(status: RetrievalStatus) -> bool:
 
     The server sends ``RERANKING_FAILED`` and, for a reranker id it cannot
     find, also ``NOT_FOUND`` naming the reranker in ``details`` or in the
-    message. A ``NOT_FOUND`` about anything else does not count.
+    message. A ``NOT_FOUND`` about anything else -- an LLM id, a space --
+    does not count: an LLM does not rerank, so its failure leaves the
+    scores as they were.
 
     Args:
         status (RetrievalStatus): A classified status from the stream.

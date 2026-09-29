@@ -21,6 +21,8 @@ API_KEY = os.environ.get("GOODMEM_API_KEY")
 BASE_URL = os.environ.get("GOODMEM_BASE_URL")
 VERIFY_SSL = os.environ.get("GOODMEM_VERIFY_SSL", "false").lower() == "true"
 FAILING_EMBEDDER = os.environ.get("GOODMEM_TEST_FAILING_EMBEDDER_ID")
+LLM = os.environ.get("GOODMEM_TEST_LLM_ID")
+FAILING_LLM = os.environ.get("GOODMEM_TEST_FAILING_LLM_ID")
 
 pytestmark = pytest.mark.skipif(
     not (API_KEY and BASE_URL),
@@ -136,6 +138,50 @@ class TestLiveRetrieval:
             client.delete_space(empty["space_id"])
         assert out["total_results"] == 0
         assert elapsed < 3.0, f"an empty search took {elapsed:.1f}s"
+
+
+class TestLiveLlm:
+    def test_the_llm_answers_and_the_payload_carries_it(self, client, space, seeded):
+        if not LLM:
+            pytest.skip("GOODMEM_TEST_LLM_ID is not set")
+        canary = seeded[0]
+        out = client.retrieve_memories(
+            f"What is the HoneyHive live canary? Quote it exactly ({canary}).",
+            [space],
+            max_results=3,
+            llm_id=LLM,
+        )
+        assert out["partial"] is False and out["statuses"] == []
+        assert out["results"], "the hits were dropped"
+        assert out["abstract_reply"].strip()
+        assert canary in out["abstract_reply"]
+        assert all(r["score_kind"] == "vector" for r in out["results"])
+
+    def test_an_unknown_llm_is_partial_and_keeps_the_hits(self, client, space, seeded):
+        missing = str(uuid.uuid4())
+        out = client.retrieve_memories(
+            seeded[0], [space], max_results=3, llm_id=missing
+        )
+        assert out["partial"] is True
+        codes = [s["code"] for s in out["statuses"]]
+        assert "NOT_FOUND" in codes and "SUMMARIZATION_FAILED" in codes, codes
+        assert missing in out["warning"]
+        assert out["total_results"] > 0, "the hits were dropped"
+        assert "abstract_reply" not in out
+
+    def test_a_failing_llm_is_partial_and_keeps_the_hits(self, client, space, seeded):
+        if not FAILING_LLM:
+            pytest.skip("GOODMEM_TEST_FAILING_LLM_ID is not set")
+        out = client.retrieve_memories(
+            seeded[0], [space], max_results=3, llm_id=FAILING_LLM
+        )
+        assert out["partial"] is True
+        assert "SUMMARIZATION_FAILED" in [s["code"] for s in out["statuses"]]
+        assert out["total_results"] > 0 and "abstract_reply" not in out
+
+    def test_a_non_uuid_llm_id_is_refused(self, client, space):
+        with pytest.raises(GoodMemError, match="llm_id must be a UUID"):
+            client.retrieve_memories("q", [space], llm_id="not-a-uuid")
 
 
 class TestLiveFilters:
