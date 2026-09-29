@@ -15,7 +15,7 @@ import uuid
 
 import pytest
 
-from honeyhive_goodmem import GoodMemClient, GoodMemConfig, GoodMemError
+from goodmem_honeyhive import GoodMemClient, GoodMemConfig, GoodMemError
 
 API_KEY = os.environ.get("GOODMEM_API_KEY")
 BASE_URL = os.environ.get("GOODMEM_BASE_URL")

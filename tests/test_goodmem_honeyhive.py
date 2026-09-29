@@ -23,14 +23,14 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
-from honeyhive_goodmem import (
+from goodmem_honeyhive import (
     GoodMemClient,
     GoodMemConfig,
     GoodMemError,
     filters,
 )
-from honeyhive_goodmem._filters import GoodMemFilterError
-from honeyhive_goodmem._results import (
+from goodmem_honeyhive._filters import GoodMemFilterError
+from goodmem_honeyhive._results import (
     MALFORMED_STREAM_CODE,
     UNKNOWN_CODE,
     classify_status,
@@ -204,10 +204,10 @@ class TestPublicReadRemoved:
     def test_no_public_read_in_any_shipped_code_path(self):
         import ast
 
-        import honeyhive_goodmem
+        import goodmem_honeyhive
 
         offenders = []
-        for path in Path(honeyhive_goodmem.__file__).parent.glob("*.py"):
+        for path in Path(goodmem_honeyhive.__file__).parent.glob("*.py"):
             tree = ast.parse(path.read_text())
             for node in ast.walk(tree):
                 if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -716,7 +716,7 @@ class TestIdsNeverReachAPathUnchecked:
         ids=repr,
     )
     def test_the_validator_accepts_only_the_canonical_form(self, bad):
-        from honeyhive_goodmem._ids import require_uuid
+        from goodmem_honeyhive._ids import require_uuid
 
         with pytest.raises(GoodMemError, match=r"^memory_id must be a UUID"):
             require_uuid(bad, "memory_id")
@@ -876,7 +876,7 @@ class TestTheIdSentIsTheIdChecked:
 
     @pytest.mark.parametrize("make", list(HONEST_DATA))
     def test_the_validator_returns_a_new_exact_str(self, make):
-        from honeyhive_goodmem._ids import require_uuid, require_uuids
+        from goodmem_honeyhive._ids import require_uuid, require_uuids
 
         given = HONEST_DATA[make]()
         out = require_uuid(given, "memory_id")
@@ -888,13 +888,13 @@ class TestTheIdSentIsTheIdChecked:
 
     @pytest.mark.parametrize("make", list(DISHONEST_DATA))
     def test_the_validator_refuses_with_its_own_error(self, make):
-        from honeyhive_goodmem._ids import require_uuid
+        from goodmem_honeyhive._ids import require_uuid
 
         with pytest.raises(GoodMemError, match=r"^memory_id must be a UUID"):
             require_uuid(DISHONEST_DATA[make](), "memory_id")
 
     def test_a_uuid_whose_stored_value_is_out_of_range_is_refused(self):
-        from honeyhive_goodmem._ids import require_uuid
+        from goodmem_honeyhive._ids import require_uuid
 
         broken = uuid.UUID(VICTIM)
         object.__setattr__(broken, "int", 1 << 130)
@@ -1216,7 +1216,7 @@ def _logged(config: GoodMemConfig) -> str:
 
     buffer = io.StringIO()
     handler = logging.StreamHandler(buffer)
-    log = logging.getLogger("honeyhive_goodmem.tests.secret")
+    log = logging.getLogger("goodmem_honeyhive.tests.secret")
     log.addHandler(handler)
     try:
         log.warning("connecting with %s", config)
@@ -1335,7 +1335,7 @@ class TestTheRealKeyStillReachesTheServer:
     def test_a_wrapped_key_is_sent_as_the_x_api_key_header(
         self, recording_server, monkeypatch
     ):
-        from honeyhive_goodmem import SecretStr
+        from goodmem_honeyhive import SecretStr
 
         with self._built(recording_server, monkeypatch, SecretStr(SECRET)) as client:
             client.get_space(SPACE_ID)
@@ -1571,7 +1571,7 @@ class TestTracerErrorRetryNeverRepeatsAWrite:
     def test_a_successful_write_is_not_repeated_by_a_retry(self):
         # Drive the guard the way honeyhive's retry does: call the traced
         # function a second time within the same call.
-        from honeyhive_goodmem import _tracing
+        from goodmem_honeyhive import _tracing
 
         calls = []
 
@@ -1636,7 +1636,7 @@ class TestGoodMemConfigTyping:
     def test_the_stored_key_is_a_secretstr_whatever_was_passed(self):
         import pydantic
 
-        from honeyhive_goodmem.types import SecretStr
+        from goodmem_honeyhive.types import SecretStr
 
         accepted = (
             "gm_offline_test_key",

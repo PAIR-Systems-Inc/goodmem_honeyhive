@@ -8,7 +8,7 @@ On 0.2.0, ``delete_memory("../spaces/<id>")`` therefore sent
 neither the client's encoding nor the server can be relied on.
 
 Every GoodMem id is a UUID, so every id a caller hands to
-:class:`~honeyhive_goodmem.GoodMemClient` goes through :func:`require_uuid`
+:class:`~goodmem_honeyhive.GoodMemClient` goes through :func:`require_uuid`
 before any request is made, and anything else is refused.
 
 The value that is sent is never the caller's object. It is a new, exact

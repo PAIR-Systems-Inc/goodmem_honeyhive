@@ -16,7 +16,7 @@ used to delete a whole space. A refused id raises :class:`GoodMemError`.
 Example::
 
     from honeyhive import HoneyHiveTracer
-    from honeyhive_goodmem import GoodMemClient, GoodMemConfig
+    from goodmem_honeyhive import GoodMemClient, GoodMemConfig
 
     HoneyHiveTracer.init(api_key="...", project="...")
     client = GoodMemClient(GoodMemConfig(base_url="...", api_key="..."))
@@ -548,7 +548,7 @@ class GoodMemClient:
             reranker_id: A reranker to apply, or ``None`` for none. Must be a
                 UUID; an empty string is refused, not read as ``None``.
             metadata_filter: Metadata every memory must match, applied
-                server-side and escaped by :mod:`honeyhive_goodmem.filters`.
+                server-side and escaped by :mod:`goodmem_honeyhive.filters`.
             llm_id: A GoodMem LLM to answer the query from the retrieved
                 chunks, or ``None`` for none. Must be a UUID; an empty string
                 is refused, not read as ``None``. Its answer is
