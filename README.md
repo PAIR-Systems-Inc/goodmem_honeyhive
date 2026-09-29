@@ -1,11 +1,11 @@
-# honeyhive-goodmem
+# goodmem-honeyhive
 
 [GoodMem](https://docs.goodmem.ai) memory as [HoneyHive](https://honeyhive.ai)-traced
 operations. Every call appears as a span alongside the rest of your agent's
 work, so memory reads and writes are visible in the same trace as the model
 calls they feed.
 
-**Version 0.3.0.** Verified against GoodMem server **v1.0.320**.
+**Version 0.4.0.** Verified against GoodMem server **v1.0.320**.
 
 > **Upgrading from 0.1.0.** This is an observability package, which makes
 > 0.1.0's worst defect specific to it: retrieval statuses were dropped, so a
@@ -30,14 +30,14 @@ calls they feed.
 ## Install
 
 ```bash
-pip install honeyhive-goodmem
+pip install goodmem-honeyhive
 ```
 
 ## Use
 
 ```python
 from honeyhive import HoneyHiveTracer
-from honeyhive_goodmem import GoodMemClient, GoodMemConfig
+from goodmem_honeyhive import GoodMemClient, GoodMemConfig
 
 HoneyHiveTracer.init(api_key="<your-honeyhive-key>", project="my-project")
 
@@ -168,7 +168,7 @@ outcome.abstract_reply  # the same text on the RetrievalOutcome
 Filters are expressions evaluated server-side, not SQL:
 
 ```python
-from honeyhive_goodmem import filters
+from goodmem_honeyhive import filters
 
 client.retrieve_memories("q", ["<space-uuid>"], metadata_filter={"tenant": "acme"})
 
@@ -207,6 +207,14 @@ a `str` or `uuid.UUID` subclass cannot change it through `lower()` or
 `__str__`. `reranker_id` and `llm_id` are optional: leave them `None` for no
 reranker and no LLM. An empty string is refused like any other non-UUID, so
 `os.getenv("RERANKER_ID", "")` needs `or None`.
+
+## Changes in 0.4.0
+
+| Was (0.3.0) | Now |
+| --- | --- |
+| Published as `honeyhive-goodmem`, imported as `honeyhive_goodmem` | Renamed to `goodmem-honeyhive` (import `goodmem_honeyhive`), the goodmem-<framework> naming used by goodmem-adk and goodmem-semantic-kernel. **Breaking:** update imports from `honeyhive_goodmem` to `goodmem_honeyhive` |
+
+No other changes. Span names (`goodmem.create_space`, `goodmem.retrieve_memories`, ...) never contained the module name and are unchanged.
 
 ## Changes in 0.3.0
 
@@ -263,20 +271,20 @@ and the error path — the server's own message reaches the caller.
 
 | Suite | Count | Needs |
 | --- | --- | --- |
-| `tests/test_honeyhive_goodmem.py` | 527 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server; the span tests use HoneyHive's own tracer in test mode with an in-memory exporter |
-| `tests/test_honeyhive_goodmem_live.py` | 20 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them. `GOODMEM_TEST_LLM_ID` (a working LLM) and `GOODMEM_TEST_FAILING_LLM_ID` (one whose provider fails) enable two of the LLM tests |
+| `tests/test_goodmem_honeyhive.py` | 527 | nothing — the real SDK over a mock transport or a local server that records every request, fed JSON and NDJSON captured from a live server; the span tests use HoneyHive's own tracer in test mode with an in-memory exporter |
+| `tests/test_goodmem_honeyhive_live.py` | 20 | `GOODMEM_API_KEY` + `GOODMEM_BASE_URL`; skips entirely without them. `GOODMEM_TEST_LLM_ID` (a working LLM) and `GOODMEM_TEST_FAILING_LLM_ID` (one whose provider fails) enable two of the LLM tests |
 
 ```bash
 pip install -e . pytest httpx "ruff==0.7.4" mypy
 
-pytest tests/test_honeyhive_goodmem.py
+pytest tests/test_goodmem_honeyhive.py
 
 GOODMEM_API_KEY=... GOODMEM_BASE_URL=... \
   GOODMEM_TEST_EMBEDDER_ID=... GOODMEM_TEST_LLM_ID=... \
-  pytest tests/test_honeyhive_goodmem_live.py
+  pytest tests/test_goodmem_honeyhive_live.py
 
-ruff check honeyhive_goodmem tests && ruff format --check honeyhive_goodmem tests
-mypy honeyhive_goodmem
+ruff check goodmem_honeyhive tests && ruff format --check goodmem_honeyhive tests
+mypy goodmem_honeyhive
 ```
 
 One offline test scans the tree for a credential-shaped string, so the defect

@@ -1,10 +1,10 @@
 [project]
-name = "honeyhive-goodmem"
+name = "goodmem-honeyhive"
 description = "GoodMem integration for HoneyHive."
 authors = [{ name = "GoodMem", email = "support@goodmem.ai" }]
 readme = "README.md"
 requires-python = ">=3.11"
-version = "0.3.0"
+version = "0.4.0"
 license-files = ["LICENSE"]
 urls.homepage = "https://github.com/PAIR-Systems-Inc/goodmem_honeyhive"
 urls.source = "https://github.com/PAIR-Systems-Inc/goodmem_honeyhive"
@@ -24,7 +24,7 @@ dependencies = [
     "goodmem>=0.1.35",
     # honeyhive imports requests at import time without declaring it; it used
     # to arrive through opentelemetry-exporter-otlp-proto-http, which dropped
-    # it in 1.45.0, and `import honeyhive_goodmem` then fails.
+    # it in 1.45.0, and `import goodmem_honeyhive` then fails.
     "requests>=2.7",
 ]
 

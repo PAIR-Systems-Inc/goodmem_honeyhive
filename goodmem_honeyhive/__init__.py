@@ -6,9 +6,9 @@ degraded retrieval is visible in the trace rather than recorded as a clean
 success.
 """
 
-from honeyhive_goodmem import filters
-from honeyhive_goodmem._filters import GoodMemFilterError
-from honeyhive_goodmem._results import (
+from goodmem_honeyhive import filters
+from goodmem_honeyhive._filters import GoodMemFilterError
+from goodmem_honeyhive._results import (
     INFORMATIONAL_CODES,
     MALFORMED_STREAM_CODE,
     UNKNOWN_CODE,
@@ -16,10 +16,10 @@ from honeyhive_goodmem._results import (
     RetrievalOutcome,
     RetrievalStatus,
 )
-from honeyhive_goodmem.client import GoodMemClient
-from honeyhive_goodmem.types import GoodMemConfig, GoodMemError, SecretStr
+from goodmem_honeyhive.client import GoodMemClient
+from goodmem_honeyhive.types import GoodMemConfig, GoodMemError, SecretStr
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "GoodMemClient",

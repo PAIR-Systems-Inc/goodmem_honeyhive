@@ -2,7 +2,7 @@
 
 Example::
 
-    from honeyhive_goodmem import filters
+    from goodmem_honeyhive import filters
 
     expression = filters.all_of(
         filters.equals("tenant", "acme"),
@@ -10,7 +10,7 @@ Example::
     )
 """
 
-from honeyhive_goodmem._filters import (
+from goodmem_honeyhive._filters import (
     GoodMemFilterError,
     all_of,
     any_of,

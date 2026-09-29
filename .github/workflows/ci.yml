@@ -37,14 +37,14 @@ jobs:
       - name: Lint
         run: |
           set -euo pipefail
-          ruff check honeyhive_goodmem tests
-          ruff format --check honeyhive_goodmem tests
+          ruff check goodmem_honeyhive tests
+          ruff format --check goodmem_honeyhive tests
 
       - name: Types
-        run: mypy honeyhive_goodmem
+        run: mypy goodmem_honeyhive
 
       - name: Offline suite
-        run: pytest tests/test_honeyhive_goodmem.py -v
+        run: pytest tests/test_goodmem_honeyhive.py -v
 
       - name: Live tests must skip without credentials
         env:
@@ -52,7 +52,7 @@ jobs:
           GOODMEM_BASE_URL: ""
         run: |
           set -euo pipefail
-          pytest tests/test_honeyhive_goodmem_live.py -v > live.log 2>&1
+          pytest tests/test_goodmem_honeyhive_live.py -v > live.log 2>&1
           grep -q "skipped" live.log
           if grep -qE "^tests.*(PASSED|FAILED)" live.log; then
             echo "A live test ran without credentials -- a key may be baked in."
@@ -66,7 +66,7 @@ jobs:
           python -m build
           python -m venv /tmp/clean
           /tmp/clean/bin/pip install --quiet dist/*.whl
-          /tmp/clean/bin/python -c "import honeyhive_goodmem; print(honeyhive_goodmem.__version__)"
+          /tmp/clean/bin/python -c "import goodmem_honeyhive; print(goodmem_honeyhive.__version__)"
 
   gates:
     runs-on: ubuntu-latest
